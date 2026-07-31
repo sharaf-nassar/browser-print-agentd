@@ -76,8 +76,10 @@ readable from a calling workflow.
 What any path that ships a `.pkg` is held to: gate, sign, notarize, staple, verify the packaged
 binary, then publish an asset that is never overwritten.
 
-The repository side of that contract is `packaging/build-pkg.sh`, `packaging/identity.sh`, and
-the `-X main.version` linker seam; a CI workflow drives it but adds no requirement of its own.
+`.github/workflows/release.yml` is that path, and the repository side of the contract it drives is
+`packaging/build-pkg.sh`, `packaging/identity.sh`, and the `-X main.version` linker seam. The
+workflow adds no packaging requirement of its own — it imports credentials, resolves a version,
+and checks the result.
 
 The payload is not built by the pipeline. A release imports the Developer ID identities and hands
 them, with the version resolved from the tag, to
@@ -93,6 +95,43 @@ read back off the built artifact before anything is published: the `.pkg` is exp
 the version is read from both `GET /health` and the `X-Print-Agent-Version` header. A version
 that exists only in a linker flag is not evidence, and neither is one reported by a binary that
 is not the one inside the package.
+
+### Trigger Surface
+
+A `vX.Y.Z` tag is the only thing that ships. The published `on:` block carries exactly
+`push: tags:` and `workflow_dispatch`, and the concurrency group is `release-${{ github.ref }}`
+with cancellation off.
+
+Cancellation is off deliberately: a cancelled release can leave a notarization submission in
+flight and a half-attached asset. A stuck release is recoverable; a partially published one is
+the thing an operator cannot reason about.
+
+The workflow names no product string of its own. It sources `packaging/identity.sh` for
+`BINARY_NAME` and `RELEASE_TAG_PREFIX` rather than restating them in `env:`, so the predicted
+`.pkg` path and the [[infrastructure#Release Chain#Asset Retention|asset-name assertion]] derive
+from the same value the packaging templates render from. The trigger glob itself cannot be
+templated, so the resolved tag is checked against `RELEASE_TAG_PREFIX` at run time — a rename
+that missed the `on:` block fails the release instead of cutting a mis-versioned one.
+
+Dry runs are what `workflow_dispatch` and a temporary branch trigger are for. Everything except
+the release attach and the rollback-target lookup is ref-agnostic, and both of those are gated on
+`github.ref_type == 'tag'`, so a non-tag run resolves `0.0.0-dryrun`, then signs, notarizes,
+staples and assesses for real while publishing nothing. A temporary branch trigger must never
+reach the default branch, and that is not left to discipline: the
+[[infrastructure#Naming Gate|naming gate]]'s class 3 assertion reds the branch carrying one.
+
+### Refusing An Unrun Gate
+
+The release calls [[infrastructure#Continuous Integration|`ci.yml`]] as its gate and reads all
+four [[infrastructure#Continuous Integration#Gate-Ran Outputs|gate-ran outputs]] back before
+anything is signed.
+
+`needs: gate` alone is not a gate, because a skipped job reports success. The first step of the
+release job therefore compares `cross_build`, `unit`, `naming` and `lat_check` against the
+literal string `true` and names every gate that is anything else. The comparison is fail-closed:
+an absent output reads as an empty string, so a gate deleted from `ci.yml`, renamed out from
+under its caller, or skipped stops the release rather than passing silently. The gate job
+inherits no secrets — every check it runs is Mac-less and credential-free.
 
 ### Signing Chain Facts
 

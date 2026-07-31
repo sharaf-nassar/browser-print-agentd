@@ -7,9 +7,9 @@ import (
 
 // version is the release the running binary was cut from.
 //
-// It is injected at link time by `.github/workflows/print-agent-release.yml`
-// with `-ldflags "-X main.version=X.Y.Z"`, taken from the `print-agent/vX.Y.Z`
-// tag that triggered the release. A build made any other way — a developer's
+// It is injected at link time by `.github/workflows/release.yml` with
+// `-ldflags "-X main.version=X.Y.Z"`, taken from the `vX.Y.Z` tag that
+// triggered the release. A build made any other way — a developer's
 // `go build`, the Mac-less CI cross-build, `go test` — keeps the default, so an
 // unversioned binary on a station is identifiable as such instead of claiming a
 // release it did not come from.

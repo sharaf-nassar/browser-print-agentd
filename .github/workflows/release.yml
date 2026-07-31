@@ -1,0 +1,495 @@
+# The shipping pipeline for browser-print-agentd.
+#
+# A `vX.Y.Z` tag is the ONLY thing that ships. The tag's version is linked into
+# the binary with `-ldflags -X main.version=`, so the agent running on a station
+# reports the release it actually came from on `GET /health` and on the
+# `X-Print-Agent-Version` header of every response — the workflow proves that by
+# expanding the built `.pkg`, booting the SIGNED binary it actually carries, and
+# reading both back before it will notarize or publish anything.
+#
+# The payload itself is NOT built here. `packaging/build-pkg.sh` owns the binary,
+# the LaunchAgent, the pre/postinstall scripts and the distribution definition,
+# and this workflow calls it with the two Developer ID identities it imported and
+# the version it resolved from the ref. One packaging recipe, exercised
+# identically by a local unsigned build and by a release, is the only way the
+# thing shipped is the thing that was tested.
+#
+# Nothing here names the product. `packaging/identity.sh` is the single identity
+# source, and this workflow SOURCES it for the binary name and the release tag
+# prefix rather than restating them in `env:` — a rename stays a one-line edit
+# there instead of drifting silently against a workflow literal that still
+# predicts the old asset name.
+#
+# The hard gate is `ci.yml`, called as a reusable workflow: no `.pkg` may be
+# signed, let alone published, unless the darwin/arm64 cross-build, the Go unit
+# suite, the repository hygiene gate and the `lat check` link check are green on
+# the commit being tagged. The `gates-ran` assertion below closes the one hole in
+# that — a SKIPPED job reports success, so `needs: gate` alone cannot tell "the
+# gate passed" from "the gate never ran". `ci.yml` re-exports one output per job
+# that is the literal string `true` only when that job reached its final step,
+# and this workflow refuses to publish on anything but four of them.
+#
+# The signing recipe is deliberately not the naive `.dmg` recipe that circulates:
+# signing a disk image never exercises `productsign`, so its `security import`
+# and `set-key-partition-list` lines omit `/usr/bin/productsign` and
+# `productsign:` and would fail the `.pkg` signing step below on a locked key.
+# `APPLE_CERTIFICATE` is one PKCS#12 carrying both Developer ID identities, and
+# the Installer identity is invisible to `security find-identity -p codesigning`,
+# so the two identities are selected with two different queries.
+# `KEYCHAIN_PASSWORD` is optional, and the build keychain falls back to an
+# ephemeral `uuidgen` value when it is not provisioned.
+#
+# Dry runs: every step except the release attach and the rollback-target lookup
+# is ref-agnostic, and both are `github.ref_type == 'tag'`-gated, so this
+# workflow can be exercised end to end from `workflow_dispatch` or from a
+# temporary branch trigger — the version then resolves to `0.0.0-dryrun` and
+# nothing is published. A temporary `push: branches:` trigger must never reach
+# the default branch; `scripts/check-naming.sh` class 3 is a YAML shape check on
+# the `on:` block below and reds the branch that carries one.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a release: a cancelled run can leave a notarization submission in
+# flight and a half-attached release asset.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The release gate. Calling the existing workflow rather than copying its jobs
+  # means the thing that gates a release is byte-identical to the thing that
+  # gates a pull request — there is no second, drifting definition of "green".
+  # No secrets are inherited: every gate runs Mac-less and credential-free.
+  gate:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    name: Sign, notarize, and publish the .pkg
+    needs: gate
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      # `needs: gate` alone is not a gate. A skipped job is a successful job, so
+      # without this a checkout that somehow lost a gate would sail through and
+      # ship an unverified .pkg. Each value is the literal string 'true' only
+      # when that job reached its final step, and an empty string otherwise, so
+      # this reads fail-closed: anything but four 'true's stops the release.
+      - name: Assert every CI gate actually ran
+        env:
+          GATE_CROSS_BUILD: ${{ needs.gate.outputs.cross_build }}
+          GATE_UNIT: ${{ needs.gate.outputs.unit }}
+          GATE_NAMING: ${{ needs.gate.outputs.naming }}
+          GATE_LAT_CHECK: ${{ needs.gate.outputs.lat_check }}
+        run: |
+          set -euo pipefail
+          echo "ci gates: cross_build=$GATE_CROSS_BUILD unit=$GATE_UNIT naming=$GATE_NAMING lat_check=$GATE_LAT_CHECK"
+          unrun=""
+          for gate in cross_build unit naming lat_check; do
+            case "$gate" in
+              cross_build) value="$GATE_CROSS_BUILD" ;;
+              unit) value="$GATE_UNIT" ;;
+              naming) value="$GATE_NAMING" ;;
+              lat_check) value="$GATE_LAT_CHECK" ;;
+            esac
+            if [ "$value" != "true" ]; then
+              unrun="$unrun $gate"
+            fi
+          done
+          if [ -n "$unrun" ]; then
+            echo "::error::ci.yml did not run these gates:$unrun — a release cannot ship unverified"
+            exit 1
+          fi
+          echo "✅ all four CI gates ran and passed" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v5
+
+      # The one place the product is named. Sourcing the identity file is what
+      # makes the asset-name assertion below meaningful: both the predicted path
+      # and the expected name derive from the same string the packaging chain
+      # renders its templates from, so they cannot disagree.
+      - name: Read the product identity
+        run: |
+          set -euo pipefail
+          BINARY_NAME=$(sh -c '. ./packaging/identity.sh; printf "%s" "${BINARY_NAME:-}"')
+          TAG_PREFIX=$(sh -c '. ./packaging/identity.sh; printf "%s" "${RELEASE_TAG_PREFIX:-}"')
+          if [ -z "$BINARY_NAME" ]; then
+            echo "::error::packaging/identity.sh did not define BINARY_NAME"
+            exit 1
+          fi
+          if [ -z "$TAG_PREFIX" ]; then
+            echo "::error::packaging/identity.sh did not define RELEASE_TAG_PREFIX"
+            exit 1
+          fi
+          echo "identity: binary=$BINARY_NAME release tag prefix=$TAG_PREFIX"
+          echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
+          echo "TAG_PREFIX=$TAG_PREFIX" >> "$GITHUB_ENV"
+
+      - name: Resolve the release version from the ref
+        run: |
+          set -euo pipefail
+          REF_NAME="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            # The trigger glob above cannot be templated, so the prefix it hard-
+            # codes is checked against the identity source here: a renamed
+            # RELEASE_TAG_PREFIX that was not mirrored into `on:` fails the
+            # release instead of cutting a mis-versioned one.
+            case "$REF_NAME" in
+              "$TAG_PREFIX"*) VERSION="${REF_NAME#"$TAG_PREFIX"}" ;;
+              *)
+                echo "::error::$REF_NAME is not a ${TAG_PREFIX}X.Y.Z release tag"
+                exit 1
+                ;;
+            esac
+            if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::$REF_NAME does not carry a bare X.Y.Z version"
+              exit 1
+            fi
+          else
+            # Dry run. Everything below still runs for real — build, sign,
+            # package, notarize, staple, Gatekeeper-assess — and only the release
+            # attach and the rollback-target lookup are skipped.
+            VERSION="0.0.0-dryrun"
+            echo "::notice::$REF_NAME is not a release tag; running as a dry run, nothing will be published"
+          fi
+          # One version string for everything: the linker stamp, the package
+          # version `build-pkg.sh` hands pkgbuild, and the asset name. The .pkg
+          # path is therefore predictable and is asserted below rather than
+          # discovered, so a packaging script that started naming its output
+          # something else fails the release instead of shipping quietly.
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PKG_PATH=$RUNNER_TEMP/release/$BINARY_NAME-$VERSION.pkg" >> "$GITHUB_ENV"
+          echo "releasing $BINARY_NAME $VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # Stdlib-only module: there are no third-party downloads to cache, and
+          # enabling the cache would demand a `go.sum` that never exists.
+          cache: false
+
+      # One import covers both identities: the provisioned p12 holds the
+      # Developer ID Application cert (for the Mach-O) and the Developer ID
+      # Installer cert (for the .pkg).
+      - name: Import the Developer ID identities
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; do
+            if [ -z "$(eval echo \"\$$v\")" ]; then
+              echo "::error::$v is empty or unset"
+              exit 1
+            fi
+          done
+          KP="${KEYCHAIN_PASSWORD:-}"
+          if [ -z "$KP" ]; then
+            KP="$(uuidgen)"
+            echo "::notice::KEYCHAIN_PASSWORD not set; using an ephemeral keychain password"
+          fi
+          echo "::add-mask::$KP"
+
+          P12="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE" | base64 -d > "$P12"
+          SIZE=$(wc -c < "$P12" | tr -d ' ')
+          MAGIC=$(head -c 2 "$P12" | xxd -p)
+          if [ "$SIZE" -lt 500 ] || [ "$MAGIC" != "3082" ]; then
+            echo "::error::APPLE_CERTIFICATE did not decode to a valid PKCS#12"
+            exit 1
+          fi
+
+          security create-keychain -p "$KP" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KP" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          # -T /usr/bin/productsign and productsign: in the partition list are
+          # the delta over a dmg-only recipe; without them the .pkg signing step
+          # below fails on a locked key.
+          security import "$P12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign:,productsign: \
+            -s -k "$KP" build.keychain >/dev/null
+          rm -f "$P12"
+
+          APP_ID=$(security find-identity -v -p codesigning build.keychain \
+            | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}' || true)
+          # The Installer identity is not a codesigning identity, so it never
+          # appears under -p codesigning and needs its own query.
+          INST_ID=$(security find-identity -v build.keychain \
+            | grep "Developer ID Installer" | head -1 | awk -F'"' '{print $2}' || true)
+          if [ -z "$APP_ID" ]; then
+            echo "::error::No 'Developer ID Application' identity in build.keychain"
+            exit 1
+          fi
+          if [ -z "$INST_ID" ]; then
+            echo "::error::No 'Developer ID Installer' identity in build.keychain — .pkg signing is impossible"
+            exit 1
+          fi
+          echo "APP_ID=$APP_ID" >> "$GITHUB_ENV"
+          echo "INST_ID=$INST_ID" >> "$GITHUB_ENV"
+
+      # The whole payload in one call: `build-pkg.sh` cross-compiles the binary
+      # (macos-latest is Apple Silicon, so darwin/arm64 is native here),
+      # codesigns it with the hardened runtime and a secure timestamp — both are
+      # notarization preconditions — stages the LaunchAgent and the
+      # pre/postinstall scripts, and runs pkgbuild → productbuild → productsign.
+      # The identities are passed rather than discovered by the script, so an
+      # unsigned local build and a release differ only in these two flags.
+      - name: Build, sign and productsign the .pkg with build-pkg.sh
+        working-directory: packaging
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          GO_LDFLAGS="-X main.version=$VERSION" \
+            ./build-pkg.sh \
+              --version "$VERSION" \
+              --arch arm64 \
+              --output "$RUNNER_TEMP/release" \
+              --app-identity "$APP_ID" \
+              --installer-identity "$INST_ID"
+          if [ ! -f "$PKG_PATH" ]; then
+            echo "::error::build-pkg.sh did not produce $PKG_PATH"
+            ls -l "$RUNNER_TEMP/release"
+            exit 1
+          fi
+          pkgutil --check-signature "$PKG_PATH"
+
+      # The version half of the release contract. It runs the binary EXTRACTED
+      # FROM THE BUILT PACKAGE, not a second build of the same source: a version
+      # that only exists in a linker flag is not evidence, and neither is one
+      # reported by a binary that is not the one inside the .pkg. Non-default
+      # ports so it cannot collide with anything on the runner.
+      - name: Verify the packaged binary reports the release version
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          set -euo pipefail
+          EXPANDED="$RUNNER_TEMP/pkg-expanded"
+          rm -rf "$EXPANDED"
+          pkgutil --expand-full "$PKG_PATH" "$EXPANDED"
+          BIN=$(find "$EXPANDED" -type f \
+            -path "*/usr/local/bin/$BINARY_NAME" -print -quit)
+          if [ -z "$BIN" ]; then
+            echo "::error::the .pkg carries no usr/local/bin/$BINARY_NAME payload"
+            find "$EXPANDED" -maxdepth 4 | head -50
+            exit 1
+          fi
+          echo "packaged binary: $BIN"
+          file "$BIN"
+          # The payload is signed inside the package; assert that here rather
+          # than trusting that build-pkg.sh was handed an identity.
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign --display --verbose=4 "$BIN" 2>&1 \
+            | grep -E "flags|Identifier|TeamIdentifier|Timestamp" || true
+
+          "$BIN" --port 19100 --https-port 19101 > agent.out 2>&1 &
+          AGENT_PID=$!
+          trap 'kill "$AGENT_PID" 2>/dev/null || true' EXIT
+          answered=false
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS -m 2 -D headers.txt -o health.json \
+              http://127.0.0.1:19100/health; then
+              answered=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$answered" != true ]; then
+            echo "::error::the packaged binary never answered GET /health"
+            cat agent.out || true
+            exit 1
+          fi
+          cat headers.txt
+          cat health.json
+          echo
+          if ! grep -qi "^x-print-agent-version: $VERSION" headers.txt; then
+            echo "::error::X-Print-Agent-Version did not report $VERSION"
+            exit 1
+          fi
+          if ! grep -q "\"version\":\"$VERSION\"" health.json; then
+            echo "::error::GET /health did not report $VERSION"
+            exit 1
+          fi
+          echo "✅ packaged binary reports version $VERSION on /health and the header" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Notarize the PKG ITSELF. Apple treats an installer package as a distinct
+      # submission type, so a green submission for a zipped binary would prove
+      # nothing about what actually ships.
+      - name: Notarize the .pkg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for v in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "$(eval echo \"\$$v\")" ]; then
+              echo "::error::$v is empty or unset"
+              exit 1
+            fi
+          done
+          cd "$RUNNER_TEMP/release"
+          set +e
+          xcrun notarytool submit "$PKG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m 2>&1 | tee notarize.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "notarytool exit: $RC"
+          if ! grep -q "status: Accepted" notarize.log; then
+            SUB=$(grep -m1 "  id:" notarize.log | awk '{print $2}' || true)
+            if [ -n "$SUB" ]; then
+              echo "== notarization log =="
+              xcrun notarytool log "$SUB" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+            fi
+            echo "::error::The .pkg was not Accepted by the notary service"
+            exit 1
+          fi
+          echo "✅ .pkg notarization Accepted" >> "$GITHUB_STEP_SUMMARY"
+
+      # Stapling is what lets a station install with no network path to Apple,
+      # so the ticket is validated rather than assumed.
+      - name: Staple the notarization ticket
+        run: |
+          set -euo pipefail
+          xcrun stapler staple -v "$PKG_PATH"
+          xcrun stapler validate -v "$PKG_PATH"
+          echo "✅ notarization ticket stapled and validated" >> "$GITHUB_STEP_SUMMARY"
+
+      # Assess the package exactly as a downloaded one is assessed: the
+      # quarantine attribute is written on purpose and never removed before the
+      # verdict, because a verdict obtained after `xattr -d` says nothing about
+      # the operator's Mac.
+      - name: Assess Gatekeeper with the quarantine bit set
+        run: |
+          set -euo pipefail
+          xattr -w com.apple.quarantine \
+            "0081;00000000;Safari;00000000-0000-0000-0000-000000000000" "$PKG_PATH"
+          set +e
+          ASSESS=$(spctl --assess -vv --type install "$PKG_PATH" 2>&1)
+          RC=$?
+          set -e
+          echo "$ASSESS"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::spctl rejected the quarantined .pkg (exit $RC)"
+            exit 1
+          fi
+          if ! echo "$ASSESS" | grep -q "source=Notarized Developer ID"; then
+            echo "::error::spctl accepted the .pkg but not as a Notarized Developer ID installer"
+            exit 1
+          fi
+          # The bit is cleared only after the verdict, so the published asset is
+          # not shipped carrying this runner's quarantine metadata.
+          xattr -d com.apple.quarantine "$PKG_PATH"
+          echo "✅ spctl: accepted, source=Notarized Developer ID (quarantined)" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The asset name carries the version, so every release keeps its own
+      # installer and the previous notarized .pkg stays downloadable — that is
+      # the retention half of the documented downgrade path (README.md,
+      # "Releases and signing"). Asserted rather than assumed: an unversioned
+      # asset name would make a downloaded installer ambiguous about which build
+      # it carries, which is exactly what an operator must not have to guess
+      # mid-rollback. Both sides of the comparison come from identity.sh.
+      - name: Assert the asset name carries the release version
+        run: |
+          set -euo pipefail
+          ASSET=$(basename "$PKG_PATH")
+          if [ "$ASSET" != "$BINARY_NAME-$VERSION.pkg" ]; then
+            echo "::error::asset is named $ASSET, not $BINARY_NAME-$VERSION.pkg; a release must be independently identifiable to be a rollback target"
+            exit 1
+          fi
+          echo "asset name: $ASSET"
+
+      - name: Attach the notarized .pkg to the tagged release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --verify-tag \
+              --title "$TAG_NAME" \
+              --notes "Notarized macOS installer for browser-print-agentd. Install the .pkg on the station Mac; the agent reports $VERSION on GET /health and the X-Print-Agent-Version header. To roll a station back to an earlier build, install that release's .pkg over this one — see README.md."
+          fi
+          # --clobber so a re-run of the same tag replaces its own asset rather
+          # than failing; a different tag is a different release and a
+          # differently-named asset, so no prior installer is ever overwritten.
+          # Nothing in this workflow deletes: there is no `gh release delete` and
+          # no `gh release delete-asset` anywhere in it, by design.
+          gh release upload "$TAG_NAME" "$PKG_PATH" --clobber
+          gh release view "$TAG_NAME" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size) bytes"'
+          echo "✅ published $(basename "$PKG_PATH") on $TAG_NAME" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Retention is only real if it is checked, so the run that ships a build
+      # also names the build a station falls back to. This reads the previous
+      # release back off GitHub and records its installer and download URL in the
+      # summary — the rollback target for THIS release, findable without digging
+      # through the releases page during an incident. A missing prior installer
+      # warns rather than fails: the .pkg just shipped is already published and
+      # Accepted, and failing here would report a bad release for a defect in an
+      # older one.
+      - name: Record the previous release as this build's rollback target
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          export TAG_PREFIX
+          PREV=$(gh release list --limit 100 --json tagName \
+            --jq '.[] | select(.tagName | startswith(env.TAG_PREFIX)) | .tagName' \
+            | grep -v "^$TAG_NAME$" | head -1 || true)
+          if [ -z "$PREV" ]; then
+            echo "::notice::no earlier release exists; this is the first shippable build and has no rollback target yet"
+            echo "ℹ️ rollback target: none — first release" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          PREV_ASSET=$(gh release view "$PREV" --json assets \
+            --jq '.assets[] | select(.name | endswith(".pkg")) | .name' | head -1 || true)
+          if [ -z "$PREV_ASSET" ]; then
+            echo "::warning::$PREV has no .pkg asset; a station on $VERSION has no one-step rollback to it"
+            echo "⚠️ rollback target $PREV has no .pkg asset" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          export PREV_ASSET
+          PREV_URL=$(gh release view "$PREV" --json assets \
+            --jq '.assets[] | select(.name == env.PREV_ASSET) | .url')
+          echo "rollback target: $PREV -> $PREV_ASSET"
+          echo "↩️ rollback target for $VERSION: [\`$PREV_ASSET\`]($PREV_URL) (\`$PREV\`) — install it over this build to downgrade a station; see \`README.md\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report the dry run
+        if: github.ref_type != 'tag'
+        run: |
+          echo "::notice::dry run complete — $(basename "$PKG_PATH") was signed, notarized and stapled but not published"
+          echo "ℹ️ dry run: nothing was published" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up the keychain
+        if: always()
+        run: security delete-keychain build.keychain || true
