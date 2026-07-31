@@ -1,0 +1,240 @@
+#!/bin/bash
+#
+# preinstall — runs as root before the payload is written.
+#
+# Rendered by build-pkg.sh from packaging/identity.sh: the launchd label, the
+# product name in the log prefixes, and the target-user environment variable are
+# all substituted at build time. Edit this template, never the staged copy.
+#
+# Three jobs, in this order, all of which must succeed before a single file is
+# laid down:
+#
+#   1. Clear the ground. Any prior copy of this agent is booted out, so nothing
+#      of ours is still bound to 9100/9101 when the payload lands.
+#   2. Remove Zebra Browser Print. The wire contract fixes ports 9100/9101, so
+#      the two agents cannot coexist (spec Q6): coexistence is eliminated at
+#      install, not detected and warned about. Removal is PATH-BASED — nothing
+#      here branches on Zebra's architecture or version, and a station that
+#      never had Zebra installed simply finds nothing to remove.
+#   3. Prove 9100 and 9101 are actually free. This is the mitigation for the
+#      worst failure mode in the plan: if something still holds those ports, a
+#      KeepAlive agent crash-loops and printing dies silently — the exact
+#      phantom failure this whole feature exists to kill. So the install fails
+#      LOUDLY here instead of producing a station that looks installed.
+#
+# The order is load-bearing: everything that legitimately owns those ports is
+# stopped first, so the port check condemns only a holder nobody can account
+# for.
+#
+# `installer` calls this with: $1 package path, $2 target location, $3 target
+# volume.
+
+set -euo pipefail
+shopt -s nullglob
+
+LABEL="__BUNDLE_ID__"
+SYSTEM_AGENT_PLIST="/Library/LaunchAgents/${LABEL}.plist"
+PORTS=(9100 9101)
+
+# How long to wait for a port to drain after its owner is stopped. A socket in
+# TIME_WAIT with no listener is not a conflict; this only covers the moment
+# between `launchctl bootout` and the process actually exiting.
+PORT_SETTLE_SECONDS=10
+
+# Tool paths are absolute because `installer` gives a preinstall a minimal PATH,
+# and overridable so the launchd calls can be pointed at a stub.
+LAUNCHCTL="${LAUNCHCTL:-/bin/launchctl}"
+
+log() { printf '[__PRODUCT_NAME__ preinstall] %s\n' "$*"; }
+fail() {
+	printf '[__PRODUCT_NAME__ preinstall] ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# launchd helpers
+# ---------------------------------------------------------------------------
+
+# Reads the Label out of a launchd plist so a job is unloaded by the name
+# launchd knows it by, rather than by guessing from the file name.
+plist_label() {
+	/usr/bin/plutil -extract Label raw -o - "$1" 2>/dev/null || true
+}
+
+# Boots a label out of every domain it could plausibly be loaded in. Every call
+# is best-effort: "not loaded" is the expected outcome most of the time.
+bootout_label() {
+	local label="$1" scope="$2"
+	[ -n "$label" ] || return 0
+	if [ "$scope" = "system" ]; then
+		"$LAUNCHCTL" bootout "system/$label" >/dev/null 2>&1 || true
+		return 0
+	fi
+	if [ -n "$TARGET_UID" ]; then
+		"$LAUNCHCTL" bootout "gui/$TARGET_UID/$label" >/dev/null 2>&1 || true
+		"$LAUNCHCTL" asuser "$TARGET_UID" "$LAUNCHCTL" remove "$label" >/dev/null 2>&1 || true
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Target account
+# ---------------------------------------------------------------------------
+
+# The agent is a per-user LaunchAgent, so anything under a home directory has to
+# be resolved against a real login account, not root. The console user is the
+# person sitting at the station; __TARGET_USER_ENV__ overrides it for
+# an automated or remote install with no one logged in.
+resolve_target_user() {
+	local candidate="${__TARGET_USER_ENV__:-}"
+	if [ -z "$candidate" ]; then
+		candidate="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+	fi
+	case "$candidate" in
+	"" | root | loginwindow | _*) return 0 ;;
+	esac
+	if ! /usr/bin/id -u "$candidate" >/dev/null 2>&1; then
+		return 0
+	fi
+	printf '%s' "$candidate"
+}
+
+TARGET_USER="$(resolve_target_user)"
+TARGET_UID=""
+TARGET_HOME=""
+if [ -n "$TARGET_USER" ]; then
+	TARGET_UID="$(/usr/bin/id -u "$TARGET_USER")"
+	TARGET_HOME="$(/usr/bin/dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+fi
+
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
+
+if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+	fail "must run as root"
+fi
+
+# Absolute install paths only make sense on the boot volume.
+target_volume="${3:-/}"
+if [ -n "$target_volume" ] && [ "$target_volume" != "/" ]; then
+	fail "this package installs to absolute paths and must target the boot volume (got '$target_volume')"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Stop any prior copy of our own agent
+# ---------------------------------------------------------------------------
+
+log "stopping any previously installed agent"
+bootout_label "$LABEL" user
+if [ -f "$SYSTEM_AGENT_PLIST" ]; then
+	# Left in place for the payload to overwrite; only the running job matters.
+	log "found an existing $SYSTEM_AGENT_PLIST (it will be replaced)"
+fi
+# An earlier layout installed the plist into the user's own LaunchAgents
+# directory. Remove that copy so the station cannot end up running two agents.
+if [ -n "$TARGET_HOME" ] && [ -f "$TARGET_HOME/Library/LaunchAgents/${LABEL}.plist" ]; then
+	log "removing a stale per-user plist at $TARGET_HOME/Library/LaunchAgents/${LABEL}.plist"
+	/bin/rm -f "$TARGET_HOME/Library/LaunchAgents/${LABEL}.plist"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Remove Zebra Browser Print
+# ---------------------------------------------------------------------------
+
+log "removing Zebra Browser Print (path-based; nothing to do on a clean station)"
+
+# Every array below is iterated as ${arr[@]+"${arr[@]}"} rather than
+# "${arr[@]}". With nullglob, a station that never had Zebra leaves these arrays
+# EMPTY, and macOS still ships bash 3.2, where expanding an empty array under
+# `set -u` is an "unbound variable" error — i.e. the clean-station case would be
+# the one that fails the install.
+zebra_system_jobs=(
+	/Library/LaunchDaemons/com.zebra.*.plist
+	/Library/LaunchDaemons/*[Bb]rowser[Pp]rint*.plist
+)
+zebra_user_jobs=(
+	/Library/LaunchAgents/com.zebra.*.plist
+	/Library/LaunchAgents/*[Bb]rowser[Pp]rint*.plist
+)
+if [ -n "$TARGET_HOME" ]; then
+	zebra_user_jobs+=(
+		"$TARGET_HOME"/Library/LaunchAgents/com.zebra.*.plist
+		"$TARGET_HOME"/Library/LaunchAgents/*[Bb]rowser[Pp]rint*.plist
+	)
+fi
+
+for plist in ${zebra_system_jobs[@]+"${zebra_system_jobs[@]}"}; do
+	[ -f "$plist" ] || continue
+	log "unloading and removing $plist"
+	bootout_label "$(plist_label "$plist")" system
+	/bin/rm -f "$plist"
+done
+for plist in ${zebra_user_jobs[@]+"${zebra_user_jobs[@]}"}; do
+	[ -f "$plist" ] || continue
+	log "unloading and removing $plist"
+	bootout_label "$(plist_label "$plist")" user
+	/bin/rm -f "$plist"
+done
+
+# Kill anything still running after its job definition is gone. Matched on the
+# full command line because Browser Print has shipped under several process
+# names; the patterns are specific enough that nothing of ours can match.
+for pattern in 'Zebra Browser Print' 'ZebraBrowserPrint' 'BrowserPrint'; do
+	/usr/bin/pkill -f "$pattern" >/dev/null 2>&1 || true
+done
+
+zebra_paths=(
+	/Applications/Zebra*Browser*Print*
+	"/Applications/Zebra Technologies"
+	/Library/Application*Support/Zebra*
+	/Library/Application*Support/*Browser*Print*
+	/usr/local/bin/*[Bb]rowser[Pp]rint*
+)
+if [ -n "$TARGET_HOME" ]; then
+	zebra_paths+=(
+		"$TARGET_HOME"/Applications/Zebra*Browser*Print*
+		"$TARGET_HOME"/Library/Application*Support/Zebra*
+		"$TARGET_HOME"/Library/Application*Support/*Browser*Print*
+	)
+fi
+for path in ${zebra_paths[@]+"${zebra_paths[@]}"}; do
+	# nullglob drops patterns that match nothing, but the two literal paths in
+	# the list survive unmatched, so existence is checked rather than assumed.
+	[ -e "$path" ] || continue
+	log "removing $path"
+	/bin/rm -rf "$path"
+done
+
+# Forget the receipts too, so a later `pkgutil --pkgs` does not report a Zebra
+# install that no longer has any files behind it.
+while read -r receipt; do
+	[ -n "$receipt" ] || continue
+	log "forgetting receipt $receipt"
+	/usr/sbin/pkgutil --forget "$receipt" >/dev/null 2>&1 || true
+done < <(/usr/sbin/pkgutil --pkgs 2>/dev/null | /usr/bin/grep -iE 'zebra|browserprint' || true)
+
+# ---------------------------------------------------------------------------
+# 3. Prove the ports are free
+# ---------------------------------------------------------------------------
+
+# Prints the listening processes on a port, or nothing when it is free.
+port_holders() {
+	/usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true
+}
+
+for port in "${PORTS[@]}"; do
+	waited=0
+	while [ -n "$(port_holders "$port")" ] && [ "$waited" -lt "$PORT_SETTLE_SECONDS" ]; do
+		sleep 1
+		waited=$((waited + 1))
+	done
+	holders="$(port_holders "$port")"
+	if [ -n "$holders" ]; then
+		printf '%s\n' "$holders" >&2
+		fail "port $port is still held after $PORT_SETTLE_SECONDS s (see the listing above). The agent would crash-loop behind a KeepAlive restart and printing would fail silently, so this install is stopping here. Stop that process (or finish removing Zebra Browser Print by hand) and re-run the installer."
+	fi
+	log "port $port is free"
+done
+
+log "preinstall complete"
+exit 0

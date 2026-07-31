@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the macOS print agent.
+
+  Rendered by build-pkg.sh from packaging/identity.sh; the installed file is
+  named __PLIST_NAME__. Do not edit the staged copy — edit this template.
+
+  This is deliberately a LaunchAgent, NOT a LaunchDaemon (plan Q6): the agent
+  needs the operator's per-user CUPS context to see the station's queues, and it
+  binds loopback for the browser running in that same login session. A
+  LaunchDaemon would run in the system context, where the user's printers and
+  the user's browser are both out of reach.
+
+  It is installed to /Library/LaunchAgents, which is still per-user — launchd
+  loads it into each user's GUI login session, one instance per logged-in
+  account — but lets the .pkg lay it down as a root-owned payload file instead
+  of writing into a home directory. Everything the agent then writes stays
+  per-account: the cert pair under ~/Library/Application Support/__SUPPORT_DIR_NAME__
+  and the log under ~/Library/Logs/__LOG_DIR_NAME__. Stations run one shared
+  login (plan Q6), so in practice that is one cert and one log per machine.
+
+  ProgramArguments points at a launcher rather than the binary because launchd
+  cannot expand a home directory in StandardOutPath/StandardErrorPath: the
+  launcher resolves $HOME itself, creates the per-user log directory, and
+  redirects the agent's output there.
+
+  This plist is the per-station configuration surface (plan Q10): ports and bind
+  address are edited here, never in code. To lock /write to the SPA origin, add
+  two more ProgramArguments strings after the https-port pair: the flag
+  "origin-allow" (with its two leading dashes) and the allowed origin, e.g.
+  https://lab.example. No origin is shipped here or anywhere else in the
+  package: leaving it out is the default log-and-allow posture, and the
+  operator's real origin is added per station after install.
+
+  KeepAlive stays the unconditional boolean. That is the honest description of
+  the job — a service that must always be up — and on macOS 26 no other shape
+  buys anything, because launchd gates a respawn on the state of the login
+  domain rather than on this file. When "launchctl print gui/<uid>" reports a
+  nonzero "on-demand count", the domain is in on-demand-only mode and launchd
+  refuses every non-demand spawn, recording the rejected reason on the job as
+  "pended nondemand spawn = <reason>": "speculative" for RunAtLoad, "inefficient"
+  for a KeepAlive respawn, "interval" for StartInterval. "inefficient" is only
+  launchd's name for an unconditional-KeepAlive relaunch — it is not a
+  power-management verdict, which is why caffeinate does not clear it.
+
+  That gate reads none of the keys below. It was measured on a station in that
+  state (2026-07-30, macOS 26.4): KeepAlive as a dict, ProcessType set to
+  Standard, Background or dropped entirely, and an added StartInterval all pend
+  exactly the same, and so does a bare /bin/sleep agent carrying nothing but
+  RunAtLoad and KeepAlive. Nothing in this plist causes it and nothing in it can
+  fix it. Only a demand reason gets through, so
+  "launchctl kickstart gui/<uid>/__BUNDLE_ID__" restores the
+  agent instantly, and the condition clears when the domain leaves on-demand-only
+  mode — in the observed case, once the restart-pending macOS update is
+  installed. docs/print-agent-runbook.md carries the diagnosis and recovery.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__BUNDLE_ID__</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__LAUNCHER_PATH__</string>
+		<string>--bind</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>9100</string>
+		<string>--https-port</string>
+		<string>9101</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

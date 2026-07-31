@@ -1,0 +1,62 @@
+# The Mac-less developer loop for browser-print-agentd.
+#
+# Everything here runs on ubuntu with no Apple hardware, no signing identity and
+# no printer. Signing and notarization live in their own workflow, which needs
+# `macos-latest` plus the Apple secrets.
+#
+# This file currently carries the Go unit suite and the repository hygiene gate.
+# The cross-build, staged-layout and `lat check` jobs are ported into it as their
+# own work item; jobs are added alongside these, never in place of them.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The whole agent is a flat stdlib-only `package main`, so the unit suite is
+  # the entire test surface. It fills the `execRunner` seam with a recording
+  # fake and never touches CUPS, which is why it runs on a runner with no
+  # printer and no Mac.
+  go-tests:
+    name: Go unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  # "Safe to publish" as one command with one exit code. Required on every push
+  # and pull request, because a scrub that is only remembered is not a scrub.
+  naming-gate:
+    name: Repository hygiene gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PyYAML for the workflow-shape assertion
+        run: python3 -m pip install --user pyyaml
+
+      - name: Naming gate
+        run: scripts/check-naming.sh

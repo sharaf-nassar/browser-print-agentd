@@ -1,0 +1,150 @@
+# Print Agent
+
+The daemon itself: how it reaches CUPS, how it names a printer so a caller's pin survives, how it
+decides a queue can actually print, what it logs, and how it reports its own version.
+
+`[[main.go#run]]` starts the listeners the frozen transport probes — plain HTTP on `:9100`
+always, HTTPS on `:9101` only when the per-station cert pair exists in `--cert-dir`, both bound
+to loopback — and refuses to start at all when `lp`/`lpstat` are absent
+(`[[main.go#verifyCUPSBinaries]]`), because an agent that cannot reach CUPS could only ever
+report phantom success.
+
+`[[server.go#agent#ServeHTTP]]` routes `GET /available`, `GET /default`, `POST /write`,
+`POST /read` and the `OPTIONS` preflight in exactly the shapes the calling transport parses,
+echoing the request `Origin` back as `Access-Control-Allow-Origin`.
+`[[discovery.go#printer#device]]` shapes each wire `Device`; only `name` and `uid` are
+load-bearing, and `provider` reports `browser-print-agentd`. Ports and bind address come from
+`[[config.go#parseConfig]]` — flag over environment over default — and there is no hand-listed
+queue flag, because the agent discovers printers instead of being told about them. Coverage lives
+in [[tests#Agent Core]].
+
+Three things differ by design from the Python reference implementation this contract was read
+off: printers are discovered from CUPS rather than hand-listed, `/write` fails over instead of
+failing when the pinned printer died between listing and writing, and every request's `Origin` is
+logged. Everything else is a faithful port, and the frozen wire contract in `README.md` is what
+holds it there.
+
+## CUPS Contract
+
+Every CUPS call the agent makes goes through `[[cups.go#cupsClient]]`, which is deliberately the
+only coupling point: raw queues are gone from macOS and printer drivers are deprecated, so the
+backend has to stay swappable.
+
+`[[cups.go#cupsClient#printRaw]]` always spools with `lp -d <queue> -o raw <file>`. `-o raw` is
+load-bearing rather than an optimization: the hardware spike proved that without it the
+`zebra.ppd` filter rasterizes the ZPL into a `~DGR:CUPS.GRF` bitmap (42 source bytes became 5553
+on the wire) and the label prints as a picture of itself — it does not error, it silently prints
+the wrong thing. Queues themselves are created (by the installer, not the agent) with
+`-m drv:///sample.drv/zebra.ppd`, because `lpadmin -m raw` now exits 1 with
+`Raw queues are no longer supported on macOS.` and the `raw  Raw Queue` line `lpinfo -m` still
+prints is vestigial and must never be probed as a capability.
+
+Status is read out of the printed TEXT, never the exit code. `[[cups.go#parseQueueEnabled]]`
+matches `printer NAME is idle.  enabled since <date>` (two spaces after `idle.`) against
+`printer NAME disabled since <date> -` plus its tab-indented `reason unknown` continuation;
+`[[cups.go#parseQueueAccepting]]` reads `NAME accepting requests since <date>` against
+`NAME not accepting requests since <date> -` plus its `Rejecting Jobs` continuation, checking the
+negative form first because the rejecting line contains the accepting line's words. Anything
+unrecognised, and any queue with no line at all, reads as unusable so an unparseable state can
+never produce a phantom success.
+
+### Capture Provenance
+
+Every `lpstat` string the parsers are tested against was captured on real hardware rather than
+written from the man pages. This section records that capture's provenance, and is what the
+fixtures in `agent_test.go` cite.
+
+The capture was taken on an Apple M1 Max running macOS 26.4 (build 25E246) with CUPS 2.3.4 and a
+Zebra ZD621 attached over USB. What it pinned down is the byte-level shape a parser has to
+tolerate: two spaces after `idle.`, the trailing ` -` and tab-indented continuation line on both
+the disabled and the rejecting forms, `lpstat -v` rows of the form `device for <queue>: <uri>`
+with **no** `direct`/`network` class prefix, a percent-encoded USB device URI carrying a
+`serial=` query parameter, and the `lpstat: Invalid destination name in list "<queue>".` text an
+absent queue produces.
+
+It also pinned the exit-code trap that the whole health design turns on: a **disabled** queue
+exits 0 from `lpstat -p`, only an **absent** queue exits 1, and `lp` accepts a job for a disabled
+queue and exits 0. That is why health is read from text, and why `lpstat -a` is a separate probe
+rather than an inference.
+
+Two fields are genericized wherever the capture is reproduced in the tree — the queue names and
+the device serial. They identify one lab's hardware, no parser reads them, and this repository is
+public. Everything else is reproduced byte for byte, quirks included, because paraphrasing the
+strings would test the parsers against fiction.
+
+## Discovery And Stable Identity
+
+`[[discovery.go#discoverPrinters]]` enumerates the station's queues from `lpstat -v` and orders
+them USB first, then network, each tier keeping CUPS's own order — the priority a hand-written
+queue list would otherwise have to supply.
+
+Each `lpstat -v` row is `device for <queue>: <uri>` with NO `direct`/`network` class prefix; that
+prefix only exists in `lpinfo -v`, which enumerates devices rather than queues, so
+`[[discovery.go#classifyConnection]]` keys on the URI scheme alone: `usb://` is USB and every
+other scheme (`socket`, `ipp`, `ipps`, `dnssd`, `lpd`, `smb`, `http`, `https`) is network. Queue
+status text is byte-identical for both transports, so the URI is the only place the transport
+appears at all.
+
+`[[discovery.go#stableUID]]` derives the identity the caller pins in `localStorage`. A device URI
+carrying `serial=` identifies the physical unit across a queue rename and distinguishes two
+identical printers on one station, so it is hashed RAW: byte for byte as reported, with no
+percent-decoding, no case folding, and no query reordering, since a decode step whose behavior
+varies across CUPS or language versions would silently shift every uid on the station and orphan
+the pin. A queue whose URI carries no serial falls back to the queue name. Consequence for a
+caller migrating from a queue-name-based agent: a pre-existing pin will not match a URI-derived
+uid, so the operator re-picks once.
+
+## Health And Failover
+
+`[[health.go#healthChecker#healthy]]` calls a queue usable only when it is present, enabled, AND
+accepting requests, and `[[health.go#healthChecker#healthyPrinters]]` filters discovery down to
+that set while preserving USB-first order.
+
+All three conditions are required because CUPS hides two separate failures. A DISABLED queue
+exits 0 from `lpstat -p` and only an ABSENT queue exits 1, so the exit code carries exactly one
+bit and health has to come from the text — trusting the exit code is what produced the original
+silent-success bug, where a dead USB queue advertised itself, `lp` accepted the job, and the
+caller reported "Sent" for a label that never printed. Separately, a `cupsreject`ed queue still
+reads `enabled` to `lpstat -p` while rejecting every job handed to it, which is invisible without
+the second `lpstat -a` check. Probes run concurrently under a per-command timeout so a wedged USB
+device reads as unhealthy instead of blocking the caller's 1500 ms reachability probe.
+
+`[[server.go#agent#resolveTarget]]` is the deliberate divergence: the reference implementation
+500s a `/write` naming a dead queue, while this agent falls over to the next healthy printer (USB
+before network), prints, returns 200, and logs an explicit fallback line naming the skipped
+device. Only when NO printer is healthy does the job fail, with a plain-text non-2xx the caller
+surfaces as a send error. The divergence is invisible to the transport, which still just sends
+`{device, data}` and reads a status.
+
+## Origin Posture
+
+The loopback surface has no token, so any page the operator visits could otherwise enumerate
+printers and spool ZPL. v1 accepts that risk only on the condition that it is auditable rather
+than silent.
+
+`[[log.go#agentLogger#request]]` records the `Origin` of every request, and
+`[[log.go#agentLogger#job]]` records each job's outcome with the device uid, byte count, `lp`
+request id, and origin — the minimal audit trail v1 commits to (a formal retention policy is a
+non-goal). `--origin-allow` takes an optional comma-separated allowlist
+(`[[server.go#parseOriginAllow]]`); when it is configured,
+`[[server.go#agent#originAllowed]]` rejects a `/write` from any other origin — including one with
+no `Origin` header — before any `lp` call runs, and logs the rejection. Unconfigured, the
+default, every origin is logged and allowed. This is additive to CORS and never changes a
+caller's own successful path.
+
+## Version And Health Surface
+
+One additive route sits beside the frozen four. `[[version.go#agent#handleHealth]]` answers
+`GET /health` with the running version, the origin posture, and every discovered queue flagged
+healthy or not.
+
+It is the inverse of `/available`, which hides unhealthy printers so a caller can never pin one,
+where triage needs to see exactly the queue that exists but cannot print. It still answers 200
+when CUPS itself is unreachable, reporting the error alongside the version, because "alive at
+version X and blind to CUPS" is the most useful thing it can say.
+
+The same version rides every response as `X-Print-Agent-Version`. `[[version.go#version]]` is the
+`-ldflags` seam [[infrastructure#Infrastructure#Release Chain]] links the release tag into; any
+other build reports `dev`, so an unversioned binary on a station is identifiable as one. The
+version never enters the frozen `Device` shape, which callers parse and pin, so these two
+surfaces are the only version channel the product has.

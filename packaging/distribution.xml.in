@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  productbuild distribution definition for the macOS print agent.
+
+  Rendered by build-pkg.sh from packaging/identity.sh. The hostArchitectures
+  value below is substituted with the architecture the binary was actually built
+  for, so the installer refuses a machine it cannot run on instead of laying
+  down a binary that will never start. The pkg-ref filename is the component
+  package name build-pkg.sh writes into the package-path directory, so the two
+  cannot disagree.
+
+  customize="never" and a single hidden choice: there is nothing to opt out of,
+  and an install that silently skipped the LaunchAgent would be worse than no
+  install at all.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>__PRODUCT_TITLE__</title>
+    <options customize="never" allow-external-scripts="false"
+             hostArchitectures="__HOST_ARCHITECTURES__"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="13.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="__BUNDLE_ID__"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="__BUNDLE_ID__" visible="false">
+        <pkg-ref id="__BUNDLE_ID__"/>
+    </choice>
+    <pkg-ref id="__BUNDLE_ID__" onConclusion="none">__COMPONENT_PKG_NAME__</pkg-ref>
+</installer-gui-script>

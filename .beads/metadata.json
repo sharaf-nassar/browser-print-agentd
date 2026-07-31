@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "zebra_mac_agent",
+  "project_id": "c1ea3376-d380-4273-9afb-9b464f90f6b1"
+}

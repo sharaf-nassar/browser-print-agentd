@@ -1,0 +1,307 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// The CUPS strings below keep the exact shape captured on the hardware spike
+// (Apple M1 Max, macOS 26.4 build 25E246, CUPS 2.3.4, ZD621 attached over USB)
+// and are the parser's real input, not paraphrases. Queue names and the device
+// serial are placeholders — no real station's values appear here:
+//
+//	printer zd621_net is idle.  enabled since Fri Jul 24 16:02:07 2026
+//	printer zd621_net disabled since Fri Jul 24 16:02:21 2026 -
+//	<TAB>reason unknown
+//	lpstat: Invalid destination name in list "nosuchqueue".
+//	zd621_net accepting requests since Fri Jul 24 16:02:07 2026
+//	zd621_net not accepting requests since Fri Jul 24 16:02:21 2026 -
+//	<TAB>Rejecting Jobs
+//	device for zd621_usb: usb://Zebra%20Technologies/ZTC%20ZD621-300dpi%20ZPL?serial=SN0000000001
+//
+// Note the two spaces after "idle.", the trailing " -" plus tab-indented
+// continuation line on both unhappy forms, and that `lpstat -v` carries NO
+// direct/network class prefix (that prefix only exists in `lpinfo -v`, which
+// enumerates devices rather than queues).
+
+const (
+	// enabledMarker / disabledMarker are the only two states `lpstat -p` reports
+	// that the agent trusts. Everything else — an unrecognised state, or no line
+	// for the queue at all — reads as unusable so an unparseable state can never
+	// produce a phantom success.
+	enabledMarker  = "enabled since"
+	disabledMarker = "disabled since"
+
+	// deviceURIPrefix introduces every `lpstat -v` line: "device for <queue>: <uri>".
+	deviceURIPrefix = "device for "
+
+	// cupsCommandTimeout bounds every individual lpstat invocation. A wedged USB
+	// device can hang `lpstat` indefinitely, and `GET /available` is the SPA's
+	// reachability probe under a 1500 ms abort, so a hung device must read as
+	// unhealthy rather than block the probe.
+	cupsCommandTimeout = 900 * time.Millisecond
+
+	// cupsPrintTimeout bounds the lp invocation. Spooling gets far more headroom
+	// than a health probe: a 4x6 label is ~540 KB of uncompressed ^GFA hex, and
+	// truncating that job would be worse than answering slowly.
+	cupsPrintTimeout = 15 * time.Second
+)
+
+// execResult is the outcome of one external command: CUPS reports state in the
+// TEXT it prints, so callers read Stdout and treat ExitCode as a single bit
+// (0 = the queue is configured, non-zero = it is absent).
+type execResult struct {
+	ExitCode int
+	Stdout   string
+	Stderr   string
+}
+
+// execRunner is the seam that keeps the agent testable without CUPS. The real
+// implementation shells out; unit tests inject a stub so no lp/lpstat binary is
+// ever required (and no label is ever spooled).
+type execRunner interface {
+	Run(ctx context.Context, name string, args ...string) (execResult, error)
+}
+
+// osRunner runs commands for real via os/exec.
+type osRunner struct{}
+
+// Run executes name with args and captures both streams. A non-zero exit is a
+// normal result, not an error — only a missing binary or an expired context is
+// returned as an error, because those are the two cases a caller must not
+// mistake for "the queue said no".
+func (osRunner) Run(ctx context.Context, name string, args ...string) (execResult, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	result := execResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, fmt.Errorf("%s timed out: %w", name, ctxErr)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.ExitCode = exitErr.ExitCode()
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// cupsClient wraps the lp/lpstat command surface the agent depends on. It is
+// the single CUPS coupling point in the agent: every lp invocation is issued
+// here, so the backend can be swapped when driver-backed queues disappear.
+type cupsClient struct {
+	runner       execRunner
+	timeout      time.Duration
+	printTimeout time.Duration
+}
+
+// newCUPSClient builds a client over runner with the default bounded timeouts.
+func newCUPSClient(runner execRunner) *cupsClient {
+	return &cupsClient{
+		runner:       runner,
+		timeout:      cupsCommandTimeout,
+		printTimeout: cupsPrintTimeout,
+	}
+}
+
+// run applies the per-command timeout on top of the caller's context so one
+// hung device cannot consume the whole request budget.
+func (c *cupsClient) run(ctx context.Context, name string, args ...string) (execResult, error) {
+	return c.runFor(ctx, c.timeout, cupsCommandTimeout, name, args...)
+}
+
+// runFor runs one command under timeout, falling back to fallback when the
+// configured timeout is unset.
+func (c *cupsClient) runFor(
+	ctx context.Context, timeout time.Duration, fallback time.Duration,
+	name string, args ...string,
+) (execResult, error) {
+	if timeout <= 0 {
+		timeout = fallback
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.runner.Run(ctx, name, args...)
+}
+
+// queueEnabled reports whether the queue exists AND is enabled.
+//
+// The exit code carries exactly one bit and it is NOT health: a DISABLED queue
+// exits 0 and an ABSENT queue exits 1. Trusting the exit code is what produced
+// the silent-success bug this agent exists to kill, so the enabled/disabled
+// verdict comes from the printed text and the exit code only rules out an
+// absent queue.
+func (c *cupsClient) queueEnabled(ctx context.Context, queue string) (bool, error) {
+	result, err := c.run(ctx, "lpstat", "-p", queue)
+	if err != nil {
+		return false, err
+	}
+	if result.ExitCode != 0 {
+		return false, nil
+	}
+	return parseQueueEnabled(result.Stdout, queue), nil
+}
+
+// queueAccepting reports whether the queue is accepting new jobs.
+//
+// This is a SEPARATE required check: after `cupsreject` a queue still reads
+// "enabled" to `lpstat -p` while rejecting every job handed to it, so
+// enabled-but-rejecting is invisible to the enabled check alone.
+func (c *cupsClient) queueAccepting(ctx context.Context, queue string) (bool, error) {
+	result, err := c.run(ctx, "lpstat", "-a", queue)
+	if err != nil {
+		return false, err
+	}
+	if result.ExitCode != 0 {
+		return false, nil
+	}
+	return parseQueueAccepting(result.Stdout, queue), nil
+}
+
+// deviceURIs enumerates the configured queues and their CUPS device URIs.
+func (c *cupsClient) deviceURIs(ctx context.Context) ([]queueDevice, error) {
+	result, err := c.run(ctx, "lpstat", "-v")
+	if err != nil {
+		return nil, err
+	}
+	return parseDeviceURIs(result.Stdout), nil
+}
+
+// printRaw spools data to queue verbatim and returns the CUPS request id.
+//
+// `-o raw` is load-bearing, not an optimization: without it the zebra.ppd
+// filter rasterizes the ZPL into a ~DGR:CUPS.GRF bitmap (42 source bytes became
+// 5553 on the wire) and the label prints as a picture of itself. It does not
+// error — it silently prints the wrong thing — so every lp invocation in this
+// agent carries it.
+func (c *cupsClient) printRaw(ctx context.Context, queue string, data []byte) (string, error) {
+	file, err := os.CreateTemp("", tempPrefix+"-*.zpl")
+	if err != nil {
+		return "", fmt.Errorf("create spool file: %w", err)
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return "", fmt.Errorf("write spool file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close spool file: %w", err)
+	}
+
+	result, err := c.runFor(
+		ctx, c.printTimeout, cupsPrintTimeout, "lp", "-d", queue, "-o", "raw", path)
+	if err != nil {
+		return "", err
+	}
+	if result.ExitCode != 0 {
+		detail := strings.TrimSpace(result.Stderr)
+		if detail == "" {
+			detail = "lp failed"
+		}
+		return "", fmt.Errorf("%s", detail)
+	}
+	return parseRequestID(result.Stdout), nil
+}
+
+// parseQueueEnabled reads a queue's enabled/disabled state out of `lpstat -p`
+// output. Only an explicit "enabled since" counts as usable; a "disabled since"
+// line, an unrecognised line, and no line at all all read as unusable.
+//
+// Field splitting absorbs both spike quirks for free: the two spaces after
+// "idle." and the trailing " -" on the disabled form. Tab-indented continuation
+// lines ("reason unknown") never match the "printer <queue>" shape.
+func parseQueueEnabled(output string, queue string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "printer" || fields[1] != queue {
+			continue
+		}
+		state := strings.Join(fields[2:], " ")
+		if strings.Contains(state, disabledMarker) {
+			return false
+		}
+		return strings.Contains(state, enabledMarker)
+	}
+	return false
+}
+
+// parseQueueAccepting reads a queue's accepting/rejecting state out of
+// `lpstat -a` output. "not accepting requests" is checked before "accepting
+// requests" because the rejecting line contains the accepting line's words, and
+// an unrecognised or missing line reads as NOT accepting.
+func parseQueueAccepting(output string, queue string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != queue {
+			continue
+		}
+		state := strings.Join(fields[1:], " ")
+		if strings.HasPrefix(state, "not accepting requests") {
+			return false
+		}
+		return strings.HasPrefix(state, "accepting requests")
+	}
+	return false
+}
+
+// queueDevice is one `lpstat -v` row: a queue name and its raw device URI.
+type queueDevice struct {
+	Queue string
+	URI   string
+}
+
+// parseDeviceURIs turns `lpstat -v` output into queue/URI pairs, preserving
+// CUPS's own order. The URI is kept EXACTLY as reported — no percent-decoding,
+// no case folding — because it is hashed into the stable device uid.
+func parseDeviceURIs(output string) []queueDevice {
+	devices := make([]queueDevice, 0, 4)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, deviceURIPrefix) {
+			continue
+		}
+		rest := line[len(deviceURIPrefix):]
+		colon := strings.Index(rest, ": ")
+		if colon <= 0 {
+			continue
+		}
+		queue := rest[:colon]
+		uri := rest[colon+2:]
+		if queue == "" || uri == "" {
+			continue
+		}
+		devices = append(devices, queueDevice{Queue: queue, URI: uri})
+	}
+	return devices
+}
+
+// parseRequestID pulls the job id out of lp's "request id is <id> (1 file)"
+// acknowledgement, returning "" when lp said something else.
+func parseRequestID(stdout string) string {
+	line := strings.TrimSpace(stdout)
+	if line == "" {
+		return ""
+	}
+	const marker = "request id is "
+	index := strings.Index(line, marker)
+	if index < 0 {
+		return line
+	}
+	fields := strings.Fields(line[index+len(marker):])
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}

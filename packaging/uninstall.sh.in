@@ -1,0 +1,231 @@
+#!/bin/bash
+#
+# uninstall.sh — remove the macOS print agent from a station, completely.
+#
+# Rendered by build-pkg.sh from packaging/identity.sh and installed by the .pkg
+# as __UNINSTALLER_PATH__. Because every label, path and directory name below is
+# substituted at build time, this file is a template and is not runnable
+# straight from the repo — run the installed copy, or render it with
+# `STAGE_ONLY=1 packaging/build-pkg.sh`. "Completely" is the requirement (spec
+# S5):
+# the LaunchAgent is stopped and unregistered, the binary and launcher are
+# deleted, the station cert is UNTRUSTED and removed from the System keychain,
+# the cert and log directories are deleted, the installer receipt is forgotten,
+# and ports 9100/9101 are confirmed free at the end. Nothing is left behind that
+# could resurrect the agent at the next login or keep a stale trusted cert in
+# the keychain.
+#
+# Usage:
+#   sudo __UNINSTALLER_NAME__ [--user <account>] [--keep-cert]
+#
+#   --user <account>  Operate on this account instead of the console user. The
+#                     agent is a per-user LaunchAgent, so cert and log paths
+#                     live in a home directory; on a station with more than one
+#                     printing account, run this once per account.
+#   --keep-cert       Leave the cert pair on disk (still untrusted and still
+#                     unusable, because the agent is gone). For an admin who
+#                     wants to inspect it before it disappears.
+
+set -euo pipefail
+
+LABEL="__BUNDLE_ID__"
+PKG_ID="__BUNDLE_ID__"
+BINARY="__BINARY_PATH__"
+UNINSTALLER="__UNINSTALLER_PATH__"
+LIBEXEC_DIR="__LIBEXEC_DIR__"
+AGENT_PLIST="/Library/LaunchAgents/${LABEL}.plist"
+SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
+PORTS=(9100 9101)
+PORT_SETTLE_SECONDS=10
+
+TARGET_USER=""
+KEEP_CERT=0
+
+log() { printf '[__PRODUCT_NAME__ uninstall] %s\n' "$*"; }
+warn() { printf '[__PRODUCT_NAME__ uninstall] WARNING: %s\n' "$*" >&2; }
+fail() {
+	printf '[__PRODUCT_NAME__ uninstall] ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<-EOF
+		Usage: sudo $(basename "$0") [--user <account>] [--keep-cert]
+
+		Removes the macOS print agent from this station: stops and
+		unregisters the LaunchAgent, deletes the binary and launcher, untrusts
+		and deletes the station cert, removes the cert and log directories,
+		forgets the installer receipt, and confirms ports 9100/9101 are free.
+
+		  --user <account>  Operate on this account rather than the console user.
+		                    Cert and log paths are per-account, so a station with
+		                    more than one printing account needs one run each.
+		  --keep-cert       Leave the cert pair on disk (untrusted and unused).
+	EOF
+	exit "${1:-0}"
+}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--user)
+		[ "$#" -ge 2 ] || fail "--user needs an account name"
+		TARGET_USER="$2"
+		shift 2
+		;;
+	--user=*)
+		TARGET_USER="${1#--user=}"
+		shift
+		;;
+	--keep-cert)
+		KEEP_CERT=1
+		shift
+		;;
+	-h | --help)
+		usage 0
+		;;
+	*)
+		printf 'unknown argument: %s\n' "$1" >&2
+		usage 2
+		;;
+	esac
+done
+
+if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+	fail "must run as root: sudo $0"
+fi
+
+if [ -z "$TARGET_USER" ]; then
+	TARGET_USER="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+fi
+case "$TARGET_USER" in
+"" | root | loginwindow)
+	warn "no station account resolved; machine-wide files will be removed but per-account cert and logs will not. Re-run with --user <account> to finish the job."
+	TARGET_USER=""
+	;;
+esac
+
+TARGET_UID=""
+TARGET_HOME=""
+if [ -n "$TARGET_USER" ]; then
+	/usr/bin/id -u "$TARGET_USER" >/dev/null 2>&1 || fail "no such account: $TARGET_USER"
+	TARGET_UID="$(/usr/bin/id -u "$TARGET_USER")"
+	TARGET_HOME="$(/usr/bin/dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+	log "station account: $TARGET_USER (uid $TARGET_UID)"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Stop and unregister the LaunchAgent
+# ---------------------------------------------------------------------------
+
+if [ -n "$TARGET_UID" ]; then
+	log "stopping $LABEL in gui/$TARGET_UID"
+	/bin/launchctl bootout "gui/$TARGET_UID/$LABEL" >/dev/null 2>&1 || true
+	# `disable` outlives the plist: without it, a stale disabled/enabled record
+	# can survive and confuse a later reinstall.
+	/bin/launchctl disable "gui/$TARGET_UID/$LABEL" >/dev/null 2>&1 || true
+fi
+
+if [ -f "$AGENT_PLIST" ]; then
+	log "removing $AGENT_PLIST"
+	/bin/rm -f "$AGENT_PLIST"
+fi
+if [ -n "$TARGET_HOME" ] && [ -f "$TARGET_HOME/Library/LaunchAgents/${LABEL}.plist" ]; then
+	log "removing the stale per-user plist"
+	/bin/rm -f "$TARGET_HOME/Library/LaunchAgents/${LABEL}.plist"
+fi
+
+# Anything still running after the job is gone (a hand-started agent, say).
+/usr/bin/pkill -f "$BINARY" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 2. Untrust and delete the station cert
+# ---------------------------------------------------------------------------
+
+if [ -n "$TARGET_HOME" ]; then
+	CERT_DIR="$TARGET_HOME/Library/Application Support/__SUPPORT_DIR_NAME__"
+	CERT_FILE="$CERT_DIR/cert.pem"
+	LOG_DIR="$TARGET_HOME/Library/Logs/__LOG_DIR_NAME__"
+
+	if [ -f "$CERT_FILE" ]; then
+		log "removing the System keychain trust for the station cert"
+		/usr/bin/security remove-trusted-cert -d "$CERT_FILE" >/dev/null 2>&1 || true
+
+		# Delete by SHA-1 fingerprint, never by name: `-c localhost` would match
+		# any other certificate on the station called localhost, and deleting
+		# somebody else's cert is a far worse outcome than leaving ours behind.
+		fingerprint="$(/usr/bin/openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha1 2>/dev/null |
+			/usr/bin/sed -e 's/.*=//' -e 's/://g' || true)"
+		if [ -n "$fingerprint" ]; then
+			log "deleting the cert from the System keychain (SHA-1 $fingerprint)"
+			/usr/bin/security delete-certificate -Z "$fingerprint" "$SYSTEM_KEYCHAIN" >/dev/null 2>&1 ||
+				warn "the cert was not present in $SYSTEM_KEYCHAIN (already removed?)"
+		else
+			warn "could not read the cert fingerprint; check $SYSTEM_KEYCHAIN by hand"
+		fi
+	fi
+
+	if [ "$KEEP_CERT" -eq 1 ]; then
+		log "keeping $CERT_DIR on disk as requested (it is untrusted and unused)"
+	elif [ -d "$CERT_DIR" ]; then
+		log "removing $CERT_DIR"
+		/bin/rm -rf "$CERT_DIR"
+	fi
+
+	if [ -d "$LOG_DIR" ]; then
+		log "removing $LOG_DIR"
+		/bin/rm -rf "$LOG_DIR"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Remove the payload and the receipt
+# ---------------------------------------------------------------------------
+
+for path in "$BINARY" "$LIBEXEC_DIR"; do
+	if [ -e "$path" ]; then
+		log "removing $path"
+		/bin/rm -rf "$path"
+	fi
+done
+
+log "forgetting the installer receipt $PKG_ID"
+/usr/sbin/pkgutil --forget "$PKG_ID" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 4. Confirm the ports are free
+# ---------------------------------------------------------------------------
+
+port_holders() {
+	/usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true
+}
+
+status=0
+for port in "${PORTS[@]}"; do
+	waited=0
+	while [ -n "$(port_holders "$port")" ] && [ "$waited" -lt "$PORT_SETTLE_SECONDS" ]; do
+		sleep 1
+		waited=$((waited + 1))
+	done
+	holders="$(port_holders "$port")"
+	if [ -n "$holders" ]; then
+		printf '%s\n' "$holders" >&2
+		warn "port $port is still held after the uninstall (see the listing above)"
+		status=1
+	else
+		log "port $port is free"
+	fi
+done
+
+# Deleted last, and only after everything above ran: on the station this file is
+# the running script, which unlinks cleanly on macOS.
+if [ -f "$UNINSTALLER" ]; then
+	log "removing $UNINSTALLER"
+	/bin/rm -f "$UNINSTALLER"
+fi
+
+if [ "$status" -eq 0 ]; then
+	log "uninstall complete"
+else
+	warn "uninstall finished with warnings above"
+fi
+exit "$status"

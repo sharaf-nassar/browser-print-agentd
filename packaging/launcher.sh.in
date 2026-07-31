@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# launcher — the LaunchAgent's ProgramArguments target, installed as
+# __LAUNCHER_PATH__.
+#
+# Rendered by build-pkg.sh from packaging/identity.sh. Every product name, path
+# and log tag below is substituted at build time, so this file is a template and
+# not directly runnable from the repo.
+#
+# It exists for one reason: launchd does not expand a home directory in
+# StandardOutPath/StandardErrorPath, and the agent's log is per-account by
+# design (plan Q6/Q9). So the log path is resolved here, at launch, in the
+# user's own session, instead of being baked into a machine-wide plist.
+#
+# Everything the agent writes to stdout and stderr — the per-job audit lines,
+# the origin lines, the listener banner — lands in the same file, appended
+# across restarts so a KeepAlive respawn does not truncate the trail. Failures
+# that happen BEFORE the agent starts (no home directory, unwritable log
+# directory) have nowhere to log, so they go to the unified log via `logger`
+# and are readable with:
+#
+#   log show --last 1h --predicate 'eventMessage CONTAINS "__PRODUCT_NAME__"'
+#
+# Arguments are passed straight through, so the plist stays the only place a
+# station's ports and bind address are configured.
+
+set -eu
+
+BINARY="__BINARY_PATH__"
+
+# launchd sets a minimal PATH; the agent refuses to start without lp/lpstat, and
+# both live in /usr/bin. The plist sets this too — repeated here so a hand
+# `launchctl kickstart` or a direct run behaves identically.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
+export PATH
+
+note() {
+	/usr/bin/logger -t __PRODUCT_NAME__ "launcher: $1" 2>/dev/null || true
+	echo "__PRODUCT_NAME__ launcher: $1" >&2
+}
+
+home="${HOME:-}"
+if [ -z "$home" ]; then
+	# A gui/<uid> domain agent always gets HOME, but a hand-run kickstart from a
+	# stripped environment may not; ask the directory service rather than
+	# guessing /Users/<name>, which is wrong for a network or relocated account.
+	home="$(/usr/bin/dscl . -read "/Users/$(/usr/bin/id -un)" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+fi
+if [ -z "$home" ] || [ ! -d "$home" ]; then
+	note "cannot resolve the login account's home directory; refusing to start"
+	exit 78 # EX_CONFIG
+fi
+
+log_dir="$home/Library/Logs/__LOG_DIR_NAME__"
+if ! /bin/mkdir -p "$log_dir"; then
+	note "cannot create $log_dir; refusing to start"
+	exit 73 # EX_CANTCREAT
+fi
+
+if [ ! -x "$BINARY" ]; then
+	note "$BINARY is missing or not executable; refusing to start"
+	exit 69 # EX_UNAVAILABLE
+fi
+
+exec "$BINARY" "$@" >>"$log_dir/agent.log" 2>&1

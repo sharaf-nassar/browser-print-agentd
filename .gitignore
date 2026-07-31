@@ -1,0 +1,17 @@
+.claude
+.mcp.json
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# Build output. `go build ./...` drops the binary next to the sources; the
+# shipped artifact is built and signed by CI, never committed. The name is
+# identity.sh's BINARY_NAME — the only build output this repo produces.
+/browser-print-agentd
+
+# lat.md local index. The markdown under lat.md/ is the source of truth; the
+# embedding cache is rebuilt on demand and is per-machine.
+lat.md/.cache/

@@ -1,0 +1,252 @@
+#!/bin/bash
+#
+# postinstall — runs as root after the payload is written.
+#
+# Rendered by build-pkg.sh from packaging/identity.sh: the launchd label, the
+# installed paths, the per-account directory names, the temp-file prefix and the
+# target-user environment variable are all substituted at build time. Edit this
+# template, never the staged copy.
+#
+# Four jobs:
+#
+#   1. Generate the per-station TLS cert pair (SAN=localhost, EKU serverAuth,
+#      well under Apple's 825-day trust ceiling) into the login account's
+#      Application Support directory. The agent starts its :9101 listener only
+#      when this pair exists, exactly like the reference shim — no cert means no
+#      HTTPS, which the SPA surfaces as the Safari setup walkthrough instead of
+#      failing silently.
+#   2. Trust that cert in the System keychain, restricted to the SSL policy, so
+#      Safari accepts https://localhost:9101. This happens HERE, under root, on
+#      purpose: operators may not have admin rights, so trusting a cert is an
+#      install-time admin action and never something a mid-shift operator is
+#      asked to do (plan S3/Q3).
+#   3. Bootstrap the LaunchAgent into the console user's GUI session so the
+#      station is printing without a logout, and leave it registered in
+#      /Library/LaunchAgents so launchd starts it again at every login and
+#      restarts it after a crash (G6).
+#   4. Verify the agent actually answers on :9100 before reporting success. An
+#      install that "succeeded" while the agent is dead is precisely the phantom
+#      success this project exists to eliminate, so a failed probe fails the
+#      install.
+#
+# Everything under a home directory is per-account by design: the agent is a
+# per-user LaunchAgent (plan Q6). Stations run one shared login, so that means
+# one cert and one log per machine; a station that later moves to per-operator
+# accounts re-runs this installer per account.
+#
+# `installer` calls this with: $1 package path, $2 target location, $3 target
+# volume.
+
+set -euo pipefail
+
+LABEL="__BUNDLE_ID__"
+BINARY="__BINARY_PATH__"
+LAUNCHER="__LAUNCHER_PATH__"
+UNINSTALLER="__UNINSTALLER_PATH__"
+AGENT_PLIST="/Library/LaunchAgents/${LABEL}.plist"
+SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
+
+HTTP_PORT=9100
+
+# Apple refuses to trust a TLS server cert whose validity exceeds 825 days. Two
+# years leaves comfortable headroom; renewal is a re-run of this installer,
+# which is what the runbook documents.
+CERT_DAYS=730
+
+# How long the agent gets to bind its port before the install is called a
+# failure. Startup is a discovery-free bind, so this is generous.
+PROBE_ATTEMPTS=15
+
+log() { printf '[__PRODUCT_NAME__ postinstall] %s\n' "$*"; }
+fail() {
+	printf '[__PRODUCT_NAME__ postinstall] ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+	fail "must run as root"
+fi
+
+target_volume="${3:-/}"
+if [ -n "$target_volume" ] && [ "$target_volume" != "/" ]; then
+	fail "this package installs to absolute paths and must target the boot volume (got '$target_volume')"
+fi
+
+# ---------------------------------------------------------------------------
+# Target account
+# ---------------------------------------------------------------------------
+
+resolve_target_user() {
+	local candidate="${__TARGET_USER_ENV__:-}"
+	if [ -z "$candidate" ]; then
+		candidate="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+	fi
+	case "$candidate" in
+	"" | root | loginwindow | _*) return 0 ;;
+	esac
+	if ! /usr/bin/id -u "$candidate" >/dev/null 2>&1; then
+		return 0
+	fi
+	printf '%s' "$candidate"
+}
+
+TARGET_USER="$(resolve_target_user)"
+if [ -z "$TARGET_USER" ]; then
+	fail "no console user is logged in, so the per-user cert and LaunchAgent cannot be set up. Log in as the station account and re-run the installer, or set __TARGET_USER_ENV__ for an unattended install."
+fi
+TARGET_UID="$(/usr/bin/id -u "$TARGET_USER")"
+TARGET_GID="$(/usr/bin/id -g "$TARGET_USER")"
+TARGET_HOME="$(/usr/bin/dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
+	fail "cannot resolve a home directory for '$TARGET_USER'"
+fi
+log "station account: $TARGET_USER (uid $TARGET_UID), home $TARGET_HOME"
+
+CERT_DIR="$TARGET_HOME/Library/Application Support/__SUPPORT_DIR_NAME__"
+CERT_FILE="$CERT_DIR/cert.pem"
+KEY_FILE="$CERT_DIR/key.pem"
+LOG_DIR="$TARGET_HOME/Library/Logs/__LOG_DIR_NAME__"
+
+# ---------------------------------------------------------------------------
+# Payload sanity
+# ---------------------------------------------------------------------------
+
+for path in "$BINARY" "$LAUNCHER"; do
+	[ -f "$path" ] || fail "$path is missing from the installed payload"
+	/bin/chmod 755 "$path"
+done
+[ -f "$AGENT_PLIST" ] || fail "$AGENT_PLIST is missing from the installed payload"
+/usr/sbin/chown root:wheel "$AGENT_PLIST"
+/bin/chmod 644 "$AGENT_PLIST"
+if [ -f "$UNINSTALLER" ]; then
+	/bin/chmod 755 "$UNINSTALLER"
+fi
+if ! /usr/bin/plutil -lint "$AGENT_PLIST" >/dev/null; then
+	fail "$AGENT_PLIST is not a valid property list"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Per-station cert pair
+# ---------------------------------------------------------------------------
+
+# True when the existing pair is usable and not about to expire, so a reinstall
+# does not churn the cert (and therefore the trust settings) for no reason.
+cert_still_good() {
+	[ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ] || return 1
+	# 30 days of headroom: a reinstall shortly before expiry rolls the cert
+	# rather than leaving a station to break mid-shift.
+	/usr/bin/openssl x509 -in "$CERT_FILE" -noout -checkend 2592000 >/dev/null 2>&1
+}
+
+generate_cert() {
+	local conf key_tmp cert_tmp
+	conf="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/__TEMP_PREFIX__-openssl.XXXXXX")"
+	key_tmp="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/__TEMP_PREFIX__-key.XXXXXX")"
+	cert_tmp="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/__TEMP_PREFIX__-cert.XXXXXX")"
+	# shellcheck disable=SC2064 # expand the temp paths now, not at trap time
+	trap "/bin/rm -f '$conf' '$key_tmp' '$cert_tmp'" RETURN
+
+	# A config file rather than `-addext`: this has to work against whatever
+	# OpenSSL/LibreSSL the station's macOS ships, and the config path is the one
+	# both have always supported.
+	cat >"$conf" <<-'EOF'
+		[req]
+		distinguished_name = dn
+		x509_extensions = v3
+		prompt = no
+
+		[dn]
+		CN = localhost
+		O = __PRODUCT_TITLE__
+		OU = __PRODUCT_NAME__
+
+		[v3]
+		basicConstraints = critical,CA:TRUE
+		keyUsage = critical,digitalSignature,keyEncipherment,keyCertSign
+		extendedKeyUsage = serverAuth
+		subjectAltName = DNS:localhost,IP:127.0.0.1,IP:::1
+	EOF
+
+	# Self-signed and its own root: the cert is both the leaf Safari validates
+	# and the anchor it is validated against, which is why it carries CA:TRUE
+	# and is trusted below with `-r trustRoot`.
+	if ! /usr/bin/openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+		-days "$CERT_DAYS" -config "$conf" -extensions v3 \
+		-keyout "$key_tmp" -out "$cert_tmp" >/dev/null 2>&1; then
+		fail "openssl could not generate the station cert"
+	fi
+
+	/bin/mkdir -p "$CERT_DIR"
+	/bin/cp "$cert_tmp" "$CERT_FILE"
+	/bin/cp "$key_tmp" "$KEY_FILE"
+}
+
+if cert_still_good; then
+	log "reusing the existing station cert at $CERT_FILE"
+else
+	log "generating a station cert (CN=localhost, SAN=localhost, ${CERT_DAYS}-day validity)"
+	# An old cert that is being replaced must lose its trust first, or the
+	# keychain accumulates trusted certs nobody can account for.
+	if [ -f "$CERT_FILE" ]; then
+		/usr/bin/security remove-trusted-cert -d "$CERT_FILE" >/dev/null 2>&1 || true
+	fi
+	generate_cert
+fi
+
+/bin/mkdir -p "$CERT_DIR" "$LOG_DIR"
+/usr/sbin/chown -R "$TARGET_UID:$TARGET_GID" "$CERT_DIR" "$LOG_DIR"
+/bin/chmod 700 "$CERT_DIR"
+/bin/chmod 755 "$LOG_DIR"
+/bin/chmod 600 "$KEY_FILE"
+/bin/chmod 644 "$CERT_FILE"
+
+# ---------------------------------------------------------------------------
+# 2. Trust the cert
+# ---------------------------------------------------------------------------
+
+# The System keychain, not the login keychain: trust has to be machine-wide and
+# admin-owned so an operator without admin rights still gets a working Safari.
+# `-p ssl` keeps the trust to TLS server evaluation — a station-local cert has
+# no business being trusted for code signing or S/MIME.
+log "trusting the station cert in the System keychain (SSL policy only)"
+if ! /usr/bin/security add-trusted-cert -d -r trustRoot -p ssl \
+	-k "$SYSTEM_KEYCHAIN" "$CERT_FILE"; then
+	fail "could not add the station cert to the System keychain. Safari will refuse https://localhost:9101 until this succeeds; Chromium stations keep working over http://localhost:$HTTP_PORT."
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Bootstrap the LaunchAgent
+# ---------------------------------------------------------------------------
+
+log "bootstrapping $LABEL into gui/$TARGET_UID"
+# Boot out first so a reinstall replaces the running job rather than colliding
+# with it; "not loaded" is the normal outcome on a fresh station.
+/bin/launchctl bootout "gui/$TARGET_UID/$LABEL" >/dev/null 2>&1 || true
+/bin/launchctl enable "gui/$TARGET_UID/$LABEL" >/dev/null 2>&1 || true
+if ! /bin/launchctl bootstrap "gui/$TARGET_UID" "$AGENT_PLIST"; then
+	fail "launchctl could not bootstrap $AGENT_PLIST into gui/$TARGET_UID"
+fi
+/bin/launchctl kickstart -k "gui/$TARGET_UID/$LABEL" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 4. Verify the agent is actually serving
+# ---------------------------------------------------------------------------
+
+log "waiting for the agent to answer on http://127.0.0.1:$HTTP_PORT/available"
+attempt=0
+until /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$HTTP_PORT/available" >/dev/null 2>&1; do
+	attempt=$((attempt + 1))
+	if [ "$attempt" -ge "$PROBE_ATTEMPTS" ]; then
+		/bin/launchctl print "gui/$TARGET_UID/$LABEL" 2>&1 | /usr/bin/head -40 >&2 || true
+		/usr/bin/tail -20 "$LOG_DIR/agent.log" >&2 2>/dev/null || true
+		fail "the agent did not answer on port $HTTP_PORT after $PROBE_ATTEMPTS attempts. It is installed but not serving — see $LOG_DIR/agent.log and the launchctl state above. Printing WILL NOT work until this is resolved."
+	fi
+	sleep 1
+done
+
+log "agent is serving on http://127.0.0.1:$HTTP_PORT"
+log "verify by hand with: curl http://localhost:$HTTP_PORT/available"
+log "Safari path: curl https://localhost:9101/available"
+log "uninstall with: sudo $UNINSTALLER"
+log "postinstall complete"
+exit 0
