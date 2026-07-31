@@ -1,0 +1,314 @@
+# The signing-credential smoke test for browser-print-agentd.
+#
+# This workflow proves the ONE thing the release pipeline (`release.yml`) cannot
+# be written against guesswork: that a Go binary can be hardened-runtime
+# codesigned, wrapped in a `pkgbuild`/`productsign` `.pkg`, notarized AS A PKG,
+# stapled, and then installed Gatekeeper-clean with the quarantine bit still set.
+#
+# Its second job — the reason it is kept rather than deleted once the release
+# workflow exists — is to be the cheapest possible check that the Apple secrets
+# on this repository are valid and correctly encoded. A bad `APPLE_CERTIFICATE`
+# or a mistyped app-specific password surfaces here in a few minutes, on a
+# throwaway payload, instead of halfway through a release that has already built
+# and signed the real product. Run it after any credential rotation, before the
+# first release from a fresh checkout of the secrets.
+#
+# It is deliberately a throwaway. The payload is a hello-world daemon written
+# into `$RUNNER_TEMP` by this file — nothing in this repository is built, signed,
+# or shipped here, so the spike can never become a second, unreviewed release
+# path for the real agent. It also names no product string of its own: the
+# throwaway binary and package identifier are derived from
+# `packaging/identity.sh` the same way `release.yml` derives the release asset
+# name, so a rename stays a one-line edit there. The derived identifier is
+# `<BUNDLE_ID>.spike`, which is a different package from the product's own
+# `BUNDLE_ID` — the spike can never write a receipt that the real installer would
+# later mistake for its own.
+#
+# `workflow_dispatch`-only on purpose: this burns a notarization submission and a
+# `macos-latest` runner every time, and it gates nothing automatically.
+#
+# Two facts the chain pinned down and this workflow reuses verbatim, identically
+# to `release.yml`: `APPLE_CERTIFICATE` is a single PKCS#12 carrying BOTH the
+# "Developer ID Application" and the "Developer ID Installer" identity, so there
+# is exactly one import step and two different `find-identity` queries; and
+# `KEYCHAIN_PASSWORD` is not provisioned, so the build keychain's password falls
+# back to an ephemeral `uuidgen` value.
+name: Notarization Spike
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notarize-spike
+  cancel-in-progress: false
+
+env:
+  SPIKE_PKG_VERSION: 0.0.1
+
+jobs:
+  spike:
+    name: Notarize, staple, and Gatekeeper-install a hello-world pkg
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # The spike tracks the same toolchain the real agent pins, so a Go version
+      # that notarizes here is the version that will notarize in a release.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # The throwaway payload is named from the identity source rather than from
+      # a workflow literal, so this file restates no product string and a rename
+      # cannot leave a stale spike name behind.
+      - name: Read the product identity
+        run: |
+          set -euo pipefail
+          BINARY_NAME=$(sh -c '. ./packaging/identity.sh; printf "%s" "${BINARY_NAME:-}"')
+          BUNDLE_ID=$(sh -c '. ./packaging/identity.sh; printf "%s" "${BUNDLE_ID:-}"')
+          if [ -z "$BINARY_NAME" ]; then
+            echo "::error::packaging/identity.sh did not define BINARY_NAME"
+            exit 1
+          fi
+          if [ -z "$BUNDLE_ID" ]; then
+            echo "::error::packaging/identity.sh did not define BUNDLE_ID"
+            exit 1
+          fi
+          echo "identity: binary=$BINARY_NAME bundle id=$BUNDLE_ID"
+          echo "SPIKE_BINARY=$BINARY_NAME-spike" >> "$GITHUB_ENV"
+          echo "SPIKE_PKG_ID=$BUNDLE_ID.spike" >> "$GITHUB_ENV"
+
+      - name: Write the throwaway hello-world daemon
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/spike/src"
+          # The `go` directive is copied from this repository's go.mod so the
+          # throwaway module cannot pin a different language version than the
+          # toolchain setup-go just installed.
+          GO_DIRECTIVE=$(sed -n 's/^go[[:space:]]\{1,\}\([^[:space:]]*\).*$/\1/p' go.mod | head -n 1)
+          if [ -z "$GO_DIRECTIVE" ]; then
+            echo "::error::go.mod carries no go directive"
+            exit 1
+          fi
+          printf 'module spike\n\ngo %s\n' "$GO_DIRECTIVE" \
+            > "$RUNNER_TEMP/spike/src/go.mod"
+          cat "$RUNNER_TEMP/spike/src/go.mod"
+          cat > "$RUNNER_TEMP/spike/src/main.go" <<'EOF'
+          // Command spike is the notarization spike payload: the smallest Go
+          // binary that still exercises the Mach-O signing path.
+          package main
+
+          import "fmt"
+
+          func main() {
+          	fmt.Println("print agent notarization spike: ok")
+          }
+          EOF
+
+      - name: Build the darwin/arm64 binary
+        working-directory: ${{ runner.temp }}/spike/src
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          # `-buildvcs=false`: the payload lives outside the checkout on the
+          # runner, and VCS stamping must never be able to fail this build.
+          go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/spike/$SPIKE_BINARY" .
+          file "$RUNNER_TEMP/spike/$SPIKE_BINARY"
+
+      # Single import: the provisioned p12 holds both Developer ID identities.
+      # This is the step that fails first, and cheaply, on a mis-encoded or
+      # wrong-password certificate secret.
+      - name: Import the Developer ID identities
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; do
+            if [ -z "$(eval echo \"\$$v\")" ]; then
+              echo "::error::$v is empty or unset"
+              exit 1
+            fi
+          done
+          KP="${KEYCHAIN_PASSWORD:-}"
+          if [ -z "$KP" ]; then
+            KP="$(uuidgen)"
+            echo "::notice::KEYCHAIN_PASSWORD not set; using an ephemeral keychain password"
+          fi
+          echo "::add-mask::$KP"
+
+          P12="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE" | base64 -d > "$P12"
+          # Shape only, never content: a byte count and the DER header are enough
+          # to tell "the secret is not a base64 PKCS#12" from "the password is
+          # wrong", which are different human fixes.
+          SIZE=$(wc -c < "$P12" | tr -d ' ')
+          MAGIC=$(head -c 2 "$P12" | xxd -p)
+          echo "decoded p12: ${SIZE} bytes, leading bytes 0x${MAGIC} (valid DER starts 0x3082)"
+          if [ "$SIZE" -lt 500 ] || [ "$MAGIC" != "3082" ]; then
+            echo "::error::APPLE_CERTIFICATE did not decode to a valid PKCS#12"
+            exit 1
+          fi
+
+          security create-keychain -p "$KP" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KP" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          # -T /usr/bin/productsign and productsign: in the partition list are the
+          # delta over a dmg-only recipe; without them the .pkg signing step below
+          # fails on a locked key.
+          security import "$P12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign:,productsign: \
+            -s -k "$KP" build.keychain >/dev/null
+          rm -f "$P12"
+
+          APP_ID=$(security find-identity -v -p codesigning build.keychain \
+            | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}' || true)
+          # The Installer identity is not a codesigning identity, so it never
+          # appears under -p codesigning and needs its own query.
+          INST_ID=$(security find-identity -v build.keychain \
+            | grep "Developer ID Installer" | head -1 | awk -F'"' '{print $2}' || true)
+          if [ -z "$APP_ID" ]; then
+            echo "::error::No 'Developer ID Application' identity in build.keychain"
+            exit 1
+          fi
+          if [ -z "$INST_ID" ]; then
+            echo "::error::No 'Developer ID Installer' identity in build.keychain — .pkg signing is impossible"
+            exit 1
+          fi
+          echo "APP_ID=$APP_ID" >> "$GITHUB_ENV"
+          echo "INST_ID=$INST_ID" >> "$GITHUB_ENV"
+
+      # Hardened runtime plus a secure timestamp are both hard notarization
+      # preconditions; without either, notarytool rejects the pkg's payload.
+      - name: Codesign the binary with the hardened runtime
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --options runtime \
+            --sign "$APP_ID" "$RUNNER_TEMP/spike/$SPIKE_BINARY"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/spike/$SPIKE_BINARY"
+          codesign --display --verbose=4 "$RUNNER_TEMP/spike/$SPIKE_BINARY" 2>&1 \
+            | grep -E "flags|Identifier|TeamIdentifier|Timestamp" || true
+
+      - name: Build and productsign the .pkg
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/spike/payload/usr/local/bin"
+          cp "$RUNNER_TEMP/spike/$SPIKE_BINARY" "$RUNNER_TEMP/spike/payload/usr/local/bin/"
+          pkgbuild --root "$RUNNER_TEMP/spike/payload" \
+            --identifier "$SPIKE_PKG_ID" \
+            --version "$SPIKE_PKG_VERSION" \
+            --install-location / \
+            "$RUNNER_TEMP/spike/unsigned.pkg"
+          productsign --sign "$INST_ID" \
+            "$RUNNER_TEMP/spike/unsigned.pkg" "$RUNNER_TEMP/spike/$SPIKE_BINARY.pkg"
+          pkgutil --check-signature "$RUNNER_TEMP/spike/$SPIKE_BINARY.pkg"
+
+      # Notarize the PKG ITSELF, not a zipped bare binary. Apple treats an
+      # installer package as a distinct submission type and re-signs nothing, so
+      # a green zip submission is not evidence that the pkg path works. This is
+      # also the step that proves APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID are
+      # a working triple.
+      - name: Notarize the .pkg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for v in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "$(eval echo \"\$$v\")" ]; then
+              echo "::error::$v is empty or unset"
+              exit 1
+            fi
+          done
+          cd "$RUNNER_TEMP/spike"
+          set +e
+          xcrun notarytool submit "$SPIKE_BINARY.pkg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m 2>&1 | tee notarize.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "notarytool exit: $RC"
+          if ! grep -q "status: Accepted" notarize.log; then
+            SUB=$(grep -m1 "  id:" notarize.log | awk '{print $2}' || true)
+            if [ -n "$SUB" ]; then
+              echo "== notarization log =="
+              xcrun notarytool log "$SUB" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+            fi
+            echo "::error::The .pkg was not Accepted by the notary service"
+            exit 1
+          fi
+          echo "✅ .pkg notarization Accepted" >> "$GITHUB_STEP_SUMMARY"
+
+      # Stapling is what makes the install work on a station Mac with no network
+      # path to Apple, so validating the stapled ticket is part of the proof.
+      - name: Staple the notarization ticket
+        run: |
+          set -euo pipefail
+          xcrun stapler staple -v "$RUNNER_TEMP/spike/$SPIKE_BINARY.pkg"
+          xcrun stapler validate -v "$RUNNER_TEMP/spike/$SPIKE_BINARY.pkg"
+          echo "✅ notarization ticket stapled and validated" >> "$GITHUB_STEP_SUMMARY"
+
+      # NO xattr removal anywhere in this step. The quarantine bit is written on
+      # purpose so Gatekeeper faces exactly the posture a downloaded pkg has; an
+      # install that only succeeds after `xattr -d` proves nothing.
+      - name: Assess Gatekeeper with the quarantine bit set
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/spike/$SPIKE_BINARY.pkg"
+          spctl --status || true
+          xattr -w com.apple.quarantine \
+            "0081;00000000;Safari;00000000-0000-0000-0000-000000000000" "$PKG"
+          echo "quarantine attribute now: $(xattr -p com.apple.quarantine "$PKG")"
+          set +e
+          ASSESS=$(spctl --assess -vv --type install "$PKG" 2>&1)
+          RC=$?
+          set -e
+          echo "$ASSESS"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::spctl rejected the quarantined .pkg (exit $RC)"
+            exit 1
+          fi
+          if ! echo "$ASSESS" | grep -q "source=Notarized Developer ID"; then
+            echo "::error::spctl accepted the .pkg but not as a Notarized Developer ID installer"
+            exit 1
+          fi
+          echo "✅ spctl: accepted, source=Notarized Developer ID (quarantined)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the quarantined .pkg and run the payload
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/spike/$SPIKE_BINARY.pkg"
+          xattr -p com.apple.quarantine "$PKG"
+          sudo installer -pkg "$PKG" -target / -verbose
+          test -x "/usr/local/bin/$SPIKE_BINARY"
+          codesign --verify --strict --verbose=2 "/usr/local/bin/$SPIKE_BINARY"
+          OUT=$("/usr/local/bin/$SPIKE_BINARY")
+          echo "$OUT"
+          if [ "$OUT" != "print agent notarization spike: ok" ]; then
+            echo "::error::The installed binary did not produce the expected output"
+            exit 1
+          fi
+          pkgutil --pkg-info "$SPIKE_PKG_ID"
+          echo "✅ quarantined .pkg installed and the payload ran" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up the keychain
+        if: always()
+        run: security delete-keychain build.keychain || true

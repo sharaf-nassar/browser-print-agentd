@@ -136,7 +136,8 @@ inherits no secrets — every check it runs is Mac-less and credential-free.
 ### Signing Chain Facts
 
 The chain was proven end to end on a throwaway hello-world daemon before any release pipeline was
-written, and two facts it pinned down are load-bearing rather than incidental.
+written — see [[infrastructure#Release Chain#Credential Smoke Test]] — and two facts it pinned
+down are load-bearing rather than incidental.
 
 `APPLE_CERTIFICATE` is a single PKCS#12 carrying **both** the Developer ID Application and the
 Developer ID Installer identity, so one `security import` covers signing the binary and signing
@@ -152,6 +153,37 @@ the Gatekeeper assessment (`spctl --assess --type install`) is taken with the
 before the verdict, because an install that only succeeds after `xattr -d` proves nothing about
 Gatekeeper; the attribute is cleared only afterwards, so the published asset carries none of the
 runner's metadata.
+
+### Credential Smoke Test
+
+`.github/workflows/notarize-spike.yml` is that same chain run against a throwaway hello-world
+daemon, on `workflow_dispatch` only. It is the cheapest thing that can tell a maintainer an Apple
+secret is wrong.
+
+The proof it carries is identical in substance to the release path — one `security import` of the
+two Developer ID identities, a hardened-runtime `codesign`, `pkgbuild` then `productsign`,
+`notarytool submit --wait` against the `.pkg` itself, `stapler staple` and `validate`, and an
+`spctl --assess --type install` verdict taken with the quarantine attribute deliberately on — and
+it ends by installing the still-quarantined package and running the payload. What differs is the
+payload: a hello-world `main.go` written into `$RUNNER_TEMP` by the workflow itself, so nothing in
+this repository is built, signed, or shipped by it, and the spike can never become a second,
+unreviewed release path for the real agent.
+
+Its standing job is credential validation. A mis-encoded `APPLE_CERTIFICATE`, a wrong
+`APPLE_CERTIFICATE_PASSWORD`, or a stale `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` triple
+surfaces here in minutes on a disposable artifact, instead of halfway through a release that has
+already built and signed the real product — which is why it is run after any credential rotation
+and before the first release from a freshly provisioned set of secrets. The certificate check
+reports shape only, a decoded byte count and the DER header, because a public log has to be able
+to distinguish "this is not a base64 PKCS#12" from "the password is wrong" while carrying
+neither.
+
+Like the release workflow it names no product string of its own: it sources
+`packaging/identity.sh` for `BINARY_NAME` and `BUNDLE_ID` and derives `<BUNDLE_ID>.spike` as the
+throwaway package identifier. That identifier is a different package from the product's own, so a
+spike run can never leave a receipt the real installer would later mistake for its own. Dispatch
+is manual because every run burns a notarization submission and a `macos-latest` runner while
+gating nothing automatically.
 
 ### Asset Retention
 
