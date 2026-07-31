@@ -10,15 +10,17 @@ layout, and the release chain. Read `lat.md/` for the design intent behind the c
 
 ## Repository shape
 
-| Path                        | What it is                                                                       |
-| --------------------------- | -------------------------------------------------------------------------------- |
-| `*.go` (repo root)          | the whole agent — flat `package main`, stdlib only, no `go.sum`                  |
-| `agent_test.go`             | the unit suite, including the CUPS-parsing fixtures captured from real hardware  |
-| `packaging/identity.sh`     | **the single identity source**: product name, bundle id, binary name, dir names  |
-| `packaging/*.in`            | templates rendered from `identity.sh` by `build-pkg.sh` — never edit the output  |
-| `packaging/build-pkg.sh`    | cross-compile → stage → `pkgbuild` → `productbuild` → optional `productsign`     |
-| `scripts/check-naming.sh`   | the repository hygiene gate                                                      |
-| `lat.md/`                   | the design/architecture knowledge graph                                          |
+| Path                      | What it is                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------ |
+| `*.go` (repo root)        | the whole agent — flat `package main`, stdlib only, no `go.sum`                      |
+| `agent_test.go`           | the unit suite, including the CUPS-parsing fixtures captured from real hardware      |
+| `packaging/identity.sh`   | **the single identity source**: product name, bundle id, binary name, dir names      |
+| `packaging/*.in`          | templates rendered from `identity.sh` by `build-pkg.sh` — never edit the output      |
+| `packaging/build-pkg.sh`  | cross-compile → stage → `pkgbuild` → `productbuild` → optional `productsign`         |
+| `scripts/check-naming.sh` | the repository hygiene gate                                                          |
+| `README.md`               | what the agent **is**: the frozen wire contract, install layout, release chain       |
+| `RUNBOOK.md`              | what an admin **does** to a station: install, migrate, roll back, diagnose, validate |
+| `lat.md/`                 | **why** it behaves that way — the design/architecture knowledge graph                |
 
 ## Commands
 

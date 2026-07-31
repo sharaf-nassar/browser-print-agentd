@@ -72,11 +72,16 @@ within 30 days of expiry, so a rollback re-trusts nothing and Safari never re-pr
 that ever shipped is a valid target rather than only the immediately preceding one, which is what
 [[infrastructure#Infrastructure#Release Chain#Asset Retention]] exists to guarantee.
 
-The two halves of the path have different standing, and the runbook flags the difference rather
-than papering over it: retention is enforced by the release workflow on every run, while "reinstall
-the prior package and the station works again" is proven once, on hardware, by item 11 of the
-checklist below. Nothing auto-updates, so a rolled-back station stays put until an admin installs a
-newer package by hand — the last step is to pin it and file the defect against the bad release.
+The two halves of the path are proven by different mechanisms, which is why their standing can
+differ at all: retention is enforced by the release workflow on every run, while "reinstall the
+prior package and the station works again" can only be settled on hardware, once, by item 11 of the
+checklist below. Whether that hardware half has been run yet is a status that changes rather than a
+design fact, so the runbook's rollback note is its single home and this section does not restate
+it — consistent with
+[[operations#Station Operations#Station Validation Checklist#The Checklist Is Not A Run Log|the graph carrying no run results]],
+running item 11 updates that one note and nothing here. Nothing auto-updates, so a rolled-back
+station stays put until an admin installs a newer package by hand — the last step is to pin it and
+file the defect against the bad release.
 Rolling back to a version that shipped under a *different* product name is not a rollback at all
 but a migration in the other direction, and it meets the same port-freedom hard failure.
 

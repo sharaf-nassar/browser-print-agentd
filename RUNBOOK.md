@@ -372,7 +372,8 @@ reverse.
 > release workflow. The "reinstall the prior `.pkg` restores a working agent" half is validated
 > once, on a real station, by
 > [checklist item 11](#11-downgrade--reinstall-the-prior-pkg). Record the observed result here when
-> it is run.
+> it is run — this note is the only place in the repository that tracks that standing, so there is
+> nothing else to update.
 
 ## Uninstalling
 

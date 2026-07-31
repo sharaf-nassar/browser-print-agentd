@@ -10,6 +10,20 @@ set — there is no `go.sum` and no vendor directory.
 
 Read `README.md` for the frozen wire contract, the install layout, and the release chain.
 
+# Repository shape
+
+| Path                      | What it is                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------ |
+| `*.go` (repo root)        | the whole agent — flat `package main`, stdlib only, no `go.sum`                      |
+| `agent_test.go`           | the unit suite, including the CUPS-parsing fixtures captured from real hardware      |
+| `packaging/identity.sh`   | **the single identity source**: product name, bundle id, binary name, dir names      |
+| `packaging/*.in`          | templates rendered from `identity.sh` by `build-pkg.sh` — never edit the output      |
+| `packaging/build-pkg.sh`  | cross-compile → stage → `pkgbuild` → `productbuild` → optional `productsign`         |
+| `scripts/check-naming.sh` | the repository hygiene gate                                                          |
+| `README.md`               | what the agent **is**: the frozen wire contract, install layout, release chain       |
+| `RUNBOOK.md`              | what an admin **does** to a station: install, migrate, roll back, diagnose, validate |
+| `lat.md/`                 | **why** it behaves that way — the design/architecture knowledge graph                |
+
 # Before starting work
 
 - Run `lat search "<what you are about to change>"` to find the sections that describe the design
