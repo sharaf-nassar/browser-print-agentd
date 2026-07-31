@@ -14,7 +14,9 @@ hardware and lab artifacts — a printer serial, an Apple Team ID, a station IP,
 Neither class has an exception mechanism: this repository is independent of the monorepo it was
 extracted from, so there is no legitimate reason for any of those strings to appear in it, and a
 hit is always a failure. **Class 3** is a YAML shape check on the release workflow's trigger
-surface, so a temporary dry-run trigger cannot survive into the default branch. **Class 4** is
+surface: the only supported dry run is `workflow_dispatch` on a branch ref, and class 3 reds any
+branch that instead adds a `push: branches:` trigger before it can reach the default branch.
+**Class 4** is
 identity consistency: `packaging/identity.sh`'s `BINARY_NAME`
 against `[[identity.go#productName]]`, the `go.mod` module path, and the frozen
 `X-Print-Agent-Version` header.
@@ -113,12 +115,15 @@ from the same value the packaging templates render from. The trigger glob itself
 templated, so the resolved tag is checked against `RELEASE_TAG_PREFIX` at run time — a rename
 that missed the `on:` block fails the release instead of cutting a mis-versioned one.
 
-Dry runs are what `workflow_dispatch` and a temporary branch trigger are for. Everything except
-the release attach and the rollback-target lookup is ref-agnostic, and both of those are gated on
-`github.ref_type == 'tag'`, so a non-tag run resolves `0.0.0-dryrun`, then signs, notarizes,
-staples and assesses for real while publishing nothing. A temporary branch trigger must never
-reach the default branch, and that is not left to discipline: the
-[[infrastructure#Naming Gate|naming gate]]'s class 3 assertion reds the branch carrying one.
+Dry runs are what `workflow_dispatch --ref <branch>` is for: dispatching on a non-tag ref sets
+`github.ref_type` to `branch`, which is enough to select the dry-run path below without touching
+the `on:` block at all. Everything except the release attach and the rollback-target lookup is
+ref-agnostic, and both of those are gated on `github.ref_type == 'tag'`, so a non-tag run resolves
+`0.0.0-dryrun`, then signs, notarizes, staples and assesses for real while publishing nothing. A
+temporary `push: branches:` trigger is not a second dry-run route, and that is not left to
+discipline: the [[infrastructure#Naming Gate|naming gate]]'s class 3 assertion reds the branch
+carrying one, which fails the called `ci.yml` gate and leaves `release` (`needs: gate`, no `if:`)
+skipped before it signs anything.
 
 ### Refusing An Unrun Gate
 

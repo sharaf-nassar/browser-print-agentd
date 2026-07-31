@@ -41,11 +41,16 @@
 #
 # Dry runs: every step except the release attach and the rollback-target lookup
 # is ref-agnostic, and both are `github.ref_type == 'tag'`-gated, so this
-# workflow can be exercised end to end from `workflow_dispatch` or from a
-# temporary branch trigger — the version then resolves to `0.0.0-dryrun` and
-# nothing is published. A temporary `push: branches:` trigger must never reach
-# the default branch; `scripts/check-naming.sh` class 3 is a YAML shape check on
-# the `on:` block below and reds the branch that carries one.
+# workflow can be exercised end to end with
+# `gh workflow run release.yml --ref <branch>` — `workflow_dispatch` on a
+# branch ref sets `github.ref_type` to `branch`, which is enough to select the
+# dry-run path without touching the `on:` block below. The version then
+# resolves to `0.0.0-dryrun` and nothing is published. A temporary
+# `push: branches:` trigger is NOT a second dry-run route:
+# `scripts/check-naming.sh` class 3 requires the `push:` mapping below to
+# carry only `tags:`, so adding `branches:` reds the hygiene gate, which fails
+# the called `ci.yml`, which fails `gate`, and `release` (`needs: gate`, no
+# `if:`) is skipped before it signs anything.
 name: Release
 
 on:
