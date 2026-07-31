@@ -27,7 +27,9 @@ the agent's REACTION to a state — a wedged probe timing out, a hashed uid, a ~
 reaching `lp` byte-identical — but never that the state occurs on real hardware. So a USB bus
 actually re-enumerating to the same device URI, a powered-but-unresponsive printer actually
 stalling `lpstat`, and that payload actually rendering on media are not tested here and never
-will be; they need a station, a printer, and a person.
+will be; they need a station, a printer, and a person. Those are enumerated as
+[[operations#Station Operations#Station Validation Checklist]], which is the other half of this
+boundary rather than a second test suite.
 
 ### Queue Health Reads Status Text
 

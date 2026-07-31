@@ -185,7 +185,8 @@ refused.
 The consequences an admin has to plan for — uninstall the predecessor first, a freshly generated
 and re-trusted station certificate because the cert directory is named after the product, and a
 one-time printer re-pick because [[tools#Print Agent#Discovery And Stable Identity]] hashes the
-device URI rather than the queue name — are written up in `RUNBOOK.md`.
+device URI rather than the queue name — are carried as a procedure in
+[[operations#Station Operations#Migrating From A Predecessor Agent]].
 
 ### Uninstaller
 
@@ -198,3 +199,10 @@ trust and deletes the cert **by SHA-1 fingerprint** (never by name, which would 
 confirms 9100/9101 came free. One ordering trap is documented rather than designed around: the
 uninstaller deletes the log, so copy it first if the agent is being removed because something was
 wrong.
+
+Everything the script does is per-account below the machine-wide payload, so a station with more
+than one printing account needs one `--user <account>` run per account. When an admin runs it at
+all is an operations question rather than a packaging one:
+[[operations#Station Operations#Rollback Path|rolling a station back]] does not use it, an upgrade
+does not either, and the one case that requires it first is migrating away to a differently-named
+agent.

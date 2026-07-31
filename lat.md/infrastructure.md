@@ -204,7 +204,9 @@ writes something else instead of discovering whatever it happened to produce.
 
 Retention is only real if a run proves it, so the run that ships a build also names the build a
 station falls back to: after upload the previous `v*` release is read back and its installer and
-download URL recorded as this release's rollback target. Nothing in the path deletes, and a
+download URL recorded as this release's rollback target — the input
+[[operations#Station Operations#Rollback Path]] consumes, and the reason retention is a gate rather
+than a habit. Nothing in the path deletes, and a
 `--clobber` on the upload can only ever replace the asset of the tag being released, since a
 different tag is a different release. A prior release with no `.pkg` warns rather than fails —
 the package just shipped is already published and notarized, and failing there would report a bad
