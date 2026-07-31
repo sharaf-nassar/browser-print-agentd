@@ -17,6 +17,10 @@ endorsed, sponsored, certified, or supported by Zebra Technologies Corporation. 
 "Browser Print", and "ZPL" are trademarks of their respective owners and appear here only to
 name the wire contract this agent emulates.
 
+**Running this on a station?** [`RUNBOOK.md`](./RUNBOOK.md) is the admin-facing guide: install,
+migrate from another localhost print agent, roll back, uninstall, diagnose a station that will not
+print, and validate one on real hardware.
+
 ## Wire contract
 
 The contract is **frozen**. Paths, request and response shapes, status codes, plain-text error
@@ -58,10 +62,11 @@ sudo installer -pkg browser-print-agentd-<version>.pkg -target /
 
 Everything else is root work the package scripts do for you:
 
-- **`preinstall`** removes any prior install of this agent (including installs made under the
-  older product name), removes a path-matched Zebra Browser Print install if one is present, and
-  then proves ports 9100 and 9101 are actually free. Anything else holding those ports would
-  make a `KeepAlive` agent crash-loop, so the install stops loudly instead.
+- **`preinstall`** removes any prior install of **this** agent, removes a path-matched Zebra
+  Browser Print install if one is present, and then proves ports 9100 and 9101 are actually free.
+  Anything else holding those ports — including a differently-named localhost print agent — would
+  make a `KeepAlive` agent crash-loop, so the install stops loudly instead. Uninstall that agent
+  first; see [the runbook](./RUNBOOK.md#migrating-from-another-localhost-print-agent).
 - **`postinstall`** generates a per-station self-signed cert pair (CN/SAN `localhost`, EKU
   `serverAuth`) under `~/Library/Application Support/browser-print-agentd/`, trusts it in the
   **System** keychain, bootstraps the LaunchAgent into `gui/<uid>` so printing works without a

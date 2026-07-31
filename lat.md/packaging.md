@@ -168,6 +168,25 @@ an unattended install) so the station prints without a logout, and finally polls
 `http://127.0.0.1:9100/available`. A failed probe **fails the install**: reporting success while
 the agent is dead is the exact phantom success this agent exists to kill.
 
+### Migration Is Not Automatic
+
+Installing over a *differently-named* localhost print agent is a hard failure, not a migration.
+`preinstall` stops only jobs it can identify — its own launchd label and the vendor's Browser
+Print — so any other port holder trips the port-freedom check.
+
+There is no legacy-cleanup path, and the omission is deliberate. Recognising a foreign agent means
+guessing at a launchd label, an install path, and a keychain certificate that belong to a product
+this one does not own; guessing wrong deletes somebody else's software, and guessing right only
+duplicates the uninstaller that product already ships. Failing loudly with the `lsof` listing hands
+the admin an unambiguous next step instead, which is the same bargain the port check makes
+everywhere else: a station that looks installed but cannot print is worse than an install that
+refused.
+
+The consequences an admin has to plan for — uninstall the predecessor first, a freshly generated
+and re-trusted station certificate because the cert directory is named after the product, and a
+one-time printer re-pick because [[tools#Print Agent#Discovery And Stable Identity]] hashes the
+device URI rather than the queue name — are written up in `RUNBOOK.md`.
+
 ### Uninstaller
 
 `uninstall.sh.in` ships as `${UNINSTALLER_PATH}` and removes everything the installer put down,
