@@ -147,8 +147,9 @@ request, and is callable locally with no arguments.
 Releases are cut by tagging `v*.*.*` (`v0.1.0`, `v0.2.0`, …). Pushing the tag runs
 `.github/workflows/release.yml`, which:
 
-1. refuses to ship unless the CI gate — the Go unit suite and the repository hygiene gate —
-   actually ran and passed (a skipped job reports success, which is why that assertion exists);
+1. refuses to ship unless the CI gate — the `darwin/arm64` cross-build, the Go unit suite, the
+   repository hygiene gate, and the `lat check` link check — actually ran and passed (a skipped
+   job reports success, which is why that assertion exists);
 2. builds and **codesigns** the binary with a Developer ID Application identity under the
    hardened runtime, then `productsign`s the distribution package with a Developer ID Installer
    identity;

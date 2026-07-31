@@ -1,18 +1,47 @@
 # The Mac-less developer loop for browser-print-agentd.
 #
 # Everything here runs on ubuntu with no Apple hardware, no signing identity and
-# no printer. Signing and notarization live in their own workflow, which needs
-# `macos-latest` plus the Apple secrets.
+# no printer: the agent cross-compiles with `GOOS=darwin GOARCH=arm64`, and the
+# unit suite fills the `execRunner` seam with a recording fake, so CUPS is never
+# touched. Signing and notarization deliberately live in their own workflow,
+# which needs `macos-latest` plus the Apple secrets.
 #
-# This file currently carries the Go unit suite and the repository hygiene gate.
-# The cross-build, staged-layout and `lat check` jobs are ported into it as their
-# own work item; jobs are added alongside these, never in place of them.
+# Four gates, one per job: the ship-target cross-build, the unit suite, the
+# repository hygiene gate, and the lat.md link check. A green run of this file is
+# the release gate — no `.pkg` may ship unless all four passed on the commit
+# being tagged.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow calls this workflow as its gate, so the thing that gates
+  # a shipped .pkg is byte-identical to the thing that gates a pull request. The
+  # outputs below exist because a *skipped* job reports success: without them a
+  # caller cannot tell "the gate passed" from "the gate never ran", and a release
+  # would ship on the strength of a job that did nothing. Each value is 'true'
+  # only when that job reached its final step, and an empty string otherwise, so
+  # the release workflow can refuse to publish on anything but four literal
+  # 'true's.
+  #
+  # `jobs['cross-build']` uses index syntax rather than a dotted property because
+  # those job ids carry hyphens; the output ids are snake_case for the same
+  # reason, so a caller reads them back as `needs.gate.outputs.cross_build`.
+  workflow_call:
+    outputs:
+      cross_build:
+        description: Whether the darwin/arm64 cross-build and vet actually ran and passed.
+        value: ${{ jobs['cross-build'].outputs.ran }}
+      unit:
+        description: Whether the Go unit suite actually ran and passed.
+        value: ${{ jobs.unit.outputs.ran }}
+      naming:
+        description: Whether the repository hygiene gate actually ran and passed.
+        value: ${{ jobs['check-naming'].outputs.ran }}
+      lat_check:
+        description: Whether the lat.md link and code-ref check actually ran and passed.
+        value: ${{ jobs['lat-check'].outputs.ran }}
 
 permissions:
   contents: read
@@ -21,42 +50,130 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # The Go toolchain is pinned by this repository's `go.mod` (read through
+  # `go-version-file`), so the only version this workflow pins itself is the
+  # Python that backs the hygiene gate's YAML shape assertion.
+  PYTHON_VERSION: "3.12"
+
 jobs:
-  # The whole agent is a flat stdlib-only `package main`, so the unit suite is
-  # the entire test surface. It fills the `execRunner` seam with a recording
-  # fake and never touches CUPS, which is why it runs on a runner with no
-  # printer and no Mac.
-  go-tests:
-    name: Go unit tests
+  # Proves the agent builds for the only platform it ships on. Cross-compilation
+  # is what keeps the whole build Mac-less: a linux runner emits the arm64 Mach-O
+  # binary the .pkg will eventually carry. Vet runs against that same target
+  # rather than the runner's own, because darwin/arm64 is the build the product
+  # is actually made of.
+  cross-build:
+    name: Cross-build (darwin/arm64)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      ran: ${{ steps.gate.outputs.ran }}
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
+          # Stdlib-only module: there are no third-party downloads to cache, and
+          # enabling the cache would demand a `go.sum` that never exists.
+          cache: false
+
+      - name: Build darwin/arm64 binary
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: go build -o "$RUNNER_TEMP/browser-print-agentd-darwin-arm64" ./...
+
+      - name: Vet
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+        run: go vet ./...
+
+      - name: Record that this gate ran
+        id: gate
+        run: echo "ran=true" >> "$GITHUB_OUTPUT"
+
+  # The whole agent is a flat stdlib-only `package main`, so `agent_test.go` is
+  # the entire test surface. It runs natively on the runner because CUPS is
+  # injected through the stubbed exec runner — no `lp`, no `lpstat`, no printer.
+  unit:
+    name: Go unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ran: ${{ steps.gate.outputs.ran }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
 
       - name: Build
         run: go build ./...
 
-      - name: Vet
-        run: go vet ./...
-
       - name: Test
         run: go test -race ./...
 
-  # "Safe to publish" as one command with one exit code. Required on every push
-  # and pull request, because a scrub that is only remembered is not a scrub.
-  naming-gate:
+      - name: Record that this gate ran
+        id: gate
+        run: echo "ran=true" >> "$GITHUB_OUTPUT"
+
+  # "Safe to publish" as one command with one exit code. This repository was
+  # extracted from a private monorepo and the gate is what keeps it scrubbed, so
+  # it is required on every push and pull request — a scrub that is only
+  # remembered is not a scrub.
+  #
+  # PyYAML is a hard dependency rather than a convenience: the gate's
+  # release-workflow trigger assertion is a YAML shape check, and without the
+  # parser the script exits 2 instead of passing.
+  check-naming:
     name: Repository hygiene gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      ran: ${{ steps.gate.outputs.ran }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install PyYAML for the workflow-shape assertion
-        run: python3 -m pip install --user pyyaml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the YAML parser the workflow-shape assertion needs
+        run: python -m pip install --disable-pip-version-check pyyaml
 
       - name: Naming gate
-        run: scripts/check-naming.sh
+        run: scripts/check-naming.sh --fix-hint
+
+      - name: Record that this gate ran
+        id: gate
+        run: echo "ran=true" >> "$GITHUB_OUTPUT"
+
+  # The documentation graph is load-bearing here: `lat.md/` is where the design
+  # intent lives, and its wiki links point at real functions and constants, so a
+  # rename that leaves the docs behind is a broken link rather than silent drift.
+  # The tool version is pinned so a published release cannot change what this
+  # gate means.
+  lat-check:
+    name: lat.md link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ran: ${{ steps.gate.outputs.ran }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.x
+
+      - name: Check wiki links and code refs
+        run: npx --yes lat.md@0.11.0 check
+
+      - name: Record that this gate ran
+        id: gate
+        run: echo "ran=true" >> "$GITHUB_OUTPUT"

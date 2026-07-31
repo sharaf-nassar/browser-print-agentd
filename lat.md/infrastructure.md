@@ -39,6 +39,38 @@ with the subsystems that needed them. Keeping an exception mechanism with nothin
 the next hit to be declared rather than fixed, so the gate now treats class 1 exactly like class
 2 and reports the file, the line, and the matched token on any hit at all.
 
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs four gates on every push to `main` and every pull request: the
+darwin/arm64 cross-build, the Go unit suite, the [[infrastructure#Naming Gate|naming gate]], and
+the `lat check` link check.
+
+All four run on ubuntu with no Apple hardware, no signing identity and no printer. That is not a
+concession — cross-compiling the ship target is what keeps the whole build Mac-less, and the unit
+suite reaches CUPS only through the stubbed exec runner, so a linux runner can prove both the
+binary the `.pkg` will carry and the behavior it will have. `go vet` runs under
+`GOOS=darwin GOARCH=arm64` for the same reason: the target that ships is the target worth vetting.
+
+The Go toolchain is read from `go.mod` through `go-version-file` rather than restated in the
+workflow, so the pin lives in one place. Module caching is off: this is a stdlib-only module with
+no `go.sum`, and enabling the cache would demand a lockfile that never exists.
+
+### Gate-Ran Outputs
+
+The workflow is callable (`workflow_call`) and re-exports one output per job, because a **skipped**
+job reports success and a caller otherwise cannot tell "the gate passed" from "the gate never ran".
+
+Each job's final step writes `ran=true`, so the value is `true` only when that job reached the end
+of its steps and an empty string when it was skipped or failed. The release workflow calls this
+one, so the thing gating a shipped `.pkg` is byte-identical to the thing gating a pull request,
+and it refuses to publish on anything but four literal `true`s. Without that read-back a release
+could ship on the strength of a job that did nothing, which is the failure mode the outputs exist
+to make impossible.
+
+The output ids are snake_case and the hyphenated job ids are dereferenced with index syntax
+(`jobs['cross-build']`) rather than as dotted properties, so both halves of the contract stay
+readable from a calling workflow.
+
 ## Release Chain
 
 What any path that ships a `.pkg` is held to: gate, sign, notarize, staple, verify the packaged
