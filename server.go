@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,11 +27,24 @@ const (
 	// maxWriteBody caps a /write body. ZPL never approaches this; a larger body
 	// is a mistake or abuse, not a label.
 	maxWriteBody = 8 << 20
+
+	// maxPDFBody caps a /print-pdf body. A rendered label sheet is orders of
+	// magnitude smaller; a PDF this big is a mistake, not a document. The limit
+	// is deliberately far above maxWriteBody because base64 inflates the payload
+	// by a third and a multi-cell sheet carries real page content.
+	maxPDFBody = 50 << 20
+
+	// pdfMagic is the signature every PDF opens with. Anything else decoded out
+	// of 'data' is a bad payload, and printing it would put garbage on media
+	// rather than fail.
+	pdfMagic = "%PDF"
 )
 
-// writeRequest is the frozen /write body: the Device the SPA echoes back plus
-// the raw ZPL payload.
-type writeRequest struct {
+// printRequest is the body both print routes take: the Device the caller echoes
+// back plus a payload. `/write` reads Data as raw ZPL and `/print-pdf` reads it
+// as a base64-encoded PDF, but the envelope — and therefore printer selection —
+// is identical, which is why they share one type.
+type printRequest struct {
 	Device *struct {
 		UID  string `json:"uid"`
 		Name string `json:"name"`
@@ -40,7 +55,7 @@ type writeRequest struct {
 // requestedPrinter returns the device the body names, or "" when unspecified.
 // uid is the pinned identity; name is accepted as a fallback for hand-rolled
 // requests.
-func (r writeRequest) requestedPrinter() string {
+func (r printRequest) requestedPrinter() string {
 	if r.Device == nil {
 		return ""
 	}
@@ -74,8 +89,8 @@ func newAgent(runner execRunner, logger *agentLogger, originAllow []string) *age
 	}
 }
 
-// ServeHTTP routes the four wire-contract endpoints, the additive diagnostics
-// endpoint, and the CORS preflight.
+// ServeHTTP routes the four wire-contract endpoints, the two additive endpoints
+// (diagnostics and document printing), and the CORS preflight.
 //
 // Every request is logged with its Origin (Q14): the loopback surface has no
 // token, so any page the operator visits can talk to it, and v1 accepts that
@@ -103,6 +118,8 @@ func (a *agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleDefault(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/write":
 		a.handleWrite(w, r, origin)
+	case r.Method == http.MethodPost && r.URL.Path == "/print-pdf":
+		a.handlePrintPDF(w, r, origin)
 	case r.Method == http.MethodPost && r.URL.Path == "/read":
 		a.handleRead(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
@@ -176,10 +193,7 @@ func (a *agent) handleWrite(w http.ResponseWriter, r *http.Request, origin strin
 	// Origin enforcement runs FIRST: when an allowlist is configured a
 	// disallowed origin must be rejected before any CUPS work, so a hostile page
 	// cannot spool a label or even enumerate health through timing.
-	if !a.originAllowed(origin) {
-		a.logger.originRejected(origin)
-		sendText(w, http.StatusForbidden, fmt.Sprintf(
-			"origin %q is not allowed to print on this station\n", origin))
+	if !a.enforceOrigin(w, "write", origin) {
 		return
 	}
 
@@ -194,7 +208,7 @@ func (a *agent) handleWrite(w http.ResponseWriter, r *http.Request, origin strin
 		return
 	}
 
-	var payload writeRequest
+	var payload printRequest
 	if err := json.Unmarshal(body, &payload); err != nil {
 		sendText(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON body: %v\n", err))
 		return
@@ -209,7 +223,7 @@ func (a *agent) handleWrite(w http.ResponseWriter, r *http.Request, origin strin
 	ctx, cancel := context.WithTimeout(r.Context(), writeBudget)
 	defer cancel()
 
-	target, err := a.resolveTarget(ctx, payload.requestedPrinter())
+	target, err := a.resolveTarget(ctx, "write", payload.requestedPrinter())
 	if err != nil {
 		sendText(w, http.StatusInternalServerError, err.Error()+"\n")
 		return
@@ -223,6 +237,94 @@ func (a *agent) handleWrite(w http.ResponseWriter, r *http.Request, origin strin
 	}
 	a.logger.job("write", true, len(data), target, requestID, origin)
 	sendText(w, http.StatusOK, "")
+}
+
+// handlePrintPDF spools a base64-encoded PDF — the multi-cell label SHEET a
+// caller renders when one ZPL label per print will not do.
+//
+// It is additive: it sits outside the frozen Zebra-compatible contract and no
+// caller of the frozen four is affected by its existence. Everything downstream
+// of payload validation is deliberately the SAME code /write runs — the origin
+// gate, printer resolution with USB-to-network failover, the job log, and the
+// empty-200/plain-text-error convention — so a sheet and a label can never
+// disagree about which printer is usable or whether a station is dead.
+//
+// The one thing that must differ is the lp invocation: see printDocument.
+func (a *agent) handlePrintPDF(w http.ResponseWriter, r *http.Request, origin string) {
+	// Identical gate to /write, and load-bearing for the same reason. This route
+	// spools to a physical printer, so leaving it off the allowlist would make
+	// the allowlist trivially bypassable by posting a PDF instead of ZPL.
+	if !a.enforceOrigin(w, "print-pdf", origin) {
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPDFBody+1))
+	if err != nil {
+		sendText(w, http.StatusBadRequest, "could not read request body\n")
+		return
+	}
+	if len(body) > maxPDFBody {
+		sendText(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"request body too large; the /print-pdf limit is %d bytes\n", maxPDFBody))
+		return
+	}
+
+	var payload printRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		sendText(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON body: %v\n", err))
+		return
+	}
+	if payload.Data == nil {
+		sendText(w, http.StatusBadRequest,
+			"missing 'data' (base64-encoded PDF string) in request body\n")
+		return
+	}
+
+	document, err := base64.StdEncoding.DecodeString(*payload.Data)
+	if err != nil {
+		sendText(w, http.StatusBadRequest, fmt.Sprintf("invalid base64 in 'data': %v\n", err))
+		return
+	}
+	if !bytes.HasPrefix(document, []byte(pdfMagic)) {
+		// Reject rather than spool: CUPS would accept the bytes and the operator
+		// would get a page of garbage, which is the silent-wrong-output failure
+		// mode this agent exists to prevent.
+		sendText(w, http.StatusBadRequest,
+			"decoded 'data' is not a PDF (missing "+pdfMagic+" header)\n")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), writeBudget)
+	defer cancel()
+
+	target, err := a.resolveTarget(ctx, "print-pdf", payload.requestedPrinter())
+	if err != nil {
+		sendText(w, http.StatusInternalServerError, err.Error()+"\n")
+		return
+	}
+
+	requestID, err := a.cups.printDocument(ctx, target.Queue, document)
+	if err != nil {
+		a.logger.job("print-pdf", false, len(document), target, "", origin)
+		sendText(w, http.StatusInternalServerError, err.Error()+"\n")
+		return
+	}
+	a.logger.job("print-pdf", true, len(document), target, requestID, origin)
+	sendText(w, http.StatusOK, "")
+}
+
+// enforceOrigin applies the Q14 posture to a print route, writing the rejection
+// itself and reporting whether the caller may proceed. Both /write and
+// /print-pdf go through it so a route that spools to a printer cannot acquire a
+// second, weaker copy of the allowlist check.
+func (a *agent) enforceOrigin(w http.ResponseWriter, action string, origin string) bool {
+	if a.originAllowed(origin) {
+		return true
+	}
+	a.logger.originRejected(action, origin)
+	sendText(w, http.StatusForbidden, fmt.Sprintf(
+		"origin %q is not allowed to print on this station\n", origin))
+	return false
 }
 
 // originAllowed applies the Q14 posture: unconfigured means every origin is
@@ -260,7 +362,9 @@ func (a *agent) usablePrinters(ctx context.Context) ([]printer, error) {
 // discovery already orders them that way), prints, and logs an explicit
 // fallback line naming the skipped device. Only when NO printer is healthy does
 // the job fail — loudly, never as a phantom "Sent".
-func (a *agent) resolveTarget(ctx context.Context, requested string) (printer, error) {
+func (a *agent) resolveTarget(
+	ctx context.Context, action string, requested string,
+) (printer, error) {
 	printers, err := discoverPrinters(ctx, a.cups)
 	if err != nil {
 		return printer{}, fmt.Errorf("could not enumerate CUPS printers: %w", err)
@@ -276,7 +380,7 @@ func (a *agent) resolveTarget(ctx context.Context, requested string) (printer, e
 				"printer %q is not usable and no other printer on this station is "+
 					"healthy", requested)
 		}
-		a.logger.fallback(requested, usable[0])
+		a.logger.fallback(action, requested, usable[0])
 		return usable[0], nil
 	}
 

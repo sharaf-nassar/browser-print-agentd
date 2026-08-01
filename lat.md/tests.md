@@ -88,6 +88,46 @@ Verifies a ~540 KB `^GFA` payload — the size of a 4×6 label — reaches `lp` 
 that the invocation carries `-o raw`, without which the `zebra.ppd` filter would rasterize the
 ZPL and print the label as a picture of itself.
 
+### Print PDF Spools A Document Without Raw
+
+Verifies `POST /print-pdf` decodes its base64 payload, spools it byte-identically, and invokes
+`lp` as exactly `-d <queue> <file>` with **no** `-o raw`, while the same run proves `/write` still
+carries `-o raw`.
+
+The two routes are asserted apart rather than each in isolation because the failure they guard
+against is symmetrical and silent. `-o raw` on a PDF hands unrendered bytes to the device;
+its absence on ZPL lets `zebra.ppd` rasterize the label. Neither errors — both print the wrong
+thing — so a future editor "unifying" the two lp invocations has to break a named assertion.
+
+### Print PDF Rejects A Payload That Is Not A PDF
+
+Verifies a `data` field that will not base64-decode, one that decodes to something without the
+`%PDF` signature, an empty one, and a missing one are each a plain-text `400`, and that none of
+them reaches `lp`.
+
+Validation precedes every CUPS call on purpose: CUPS would accept arbitrary bytes and put garbage
+on media rather than fail, so the route has to refuse the payload itself.
+
+### Print PDF Caps The Body At Fifty Megabytes
+
+Verifies a body past the 50 MB `/print-pdf` cap is a plain-text `413` that spools nothing, and
+that a document inside the cap still prints. The cap is enforced before decoding, so an abusive
+body is never expanded in memory.
+
+### Print PDF Shares Write Failover And Origin Gating
+
+Verifies `/print-pdf` reuses `[[server.go#agent#resolveTarget]]` rather than re-implementing it:
+it fails over from a dead pinned printer with an explicit `print-pdf fallback` log line, and on a
+station with nothing healthy it returns a plain-text non-2xx with no `lp` call.
+
+It also pins the security property that makes the route safe to add. `/print-pdf` spools to a
+physical printer, so it is gated by `--origin-allow` exactly as `/write` is — a disallowed origin
+and a request with no `Origin` header are both `403` before any CUPS work, and the rejection is
+logged. A route that skipped the allowlist would make the allowlist bypassable by posting a PDF
+instead of ZPL. The CORS origin echo and `X-Print-Agent-Version` are asserted on the new error
+path and preflight too, since a browser that cannot read a `400` sees an opaque network failure
+instead of the reason.
+
 ### Origin Posture Gates Write
 
 Verifies the configured posture: with `--origin-allow` set, a `/write` from a disallowed `Origin`

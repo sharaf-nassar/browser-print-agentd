@@ -39,18 +39,19 @@ func (l *agentLogger) request(method string, path string, origin string) {
 		originField(origin)))
 }
 
-// originRejected records a /write refused by the --origin-allow allowlist,
-// before any lp call was made.
-func (l *agentLogger) originRejected(origin string) {
-	l.write(fmt.Sprintf("write REJECTED reason=origin-not-allowed origin=%s",
-		originField(origin)))
+// originRejected records a print request refused by the --origin-allow
+// allowlist, before any lp call was made. action names the route so a rejected
+// sheet and a rejected label are distinguishable in a station log.
+func (l *agentLogger) originRejected(action string, origin string) {
+	l.write(fmt.Sprintf("%s REJECTED reason=origin-not-allowed origin=%s",
+		action, originField(origin)))
 }
 
 // fallback names the printer a job skipped. The silent-success failure mode is
 // exactly what made the dead-USB bug invisible, so a failover is never quiet.
-func (l *agentLogger) fallback(requested string, target printer) {
-	l.write(fmt.Sprintf("write fallback requested=%s (unusable) -> uid=%s queue=%s",
-		requested, target.UID, target.Queue))
+func (l *agentLogger) fallback(action string, requested string, target printer) {
+	l.write(fmt.Sprintf("%s fallback requested=%s (unusable) -> uid=%s queue=%s",
+		action, requested, target.UID, target.Queue))
 }
 
 // job records the outcome of a spooled print job.

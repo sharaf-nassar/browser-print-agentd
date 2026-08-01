@@ -23,18 +23,30 @@ print, and validate one on real hardware.
 
 ## Wire contract
 
-The contract is **frozen**. Paths, request and response shapes, status codes, plain-text error
-bodies, and the CORS origin echo are compatibility surface and do not change.
+The first four rows are the **frozen** Zebra-compatible surface. Their paths, request and response
+shapes, status codes, plain-text error bodies, and the CORS origin echo are compatibility surface
+and do not change. The last two rows are **additive extensions** — they are not part of the frozen
+contract, no caller of the frozen four is affected by their existence, and an agent that predates
+them answers those paths with the plain-text `404` its default arm has always produced.
 
-| Method | Path         | Response                                                                                                                 |
-| ------ | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `GET`  | `/available` | `{"printer": [Device, …]}` — only queues that can actually print, USB before network, inside a 1500 ms probe budget       |
-| `GET`  | `/default`   | one `Device` object, or an **empty body** when nothing is healthy (an empty JSON object here would break callers)         |
-| `POST` | `/write`     | spools `{"data": "<raw ZPL>"}` to the requested (or resolved) printer; empty `200` on success, plain-text body on failure |
-| `POST` | `/read`      | empty `200` — dead surface for most callers, kept so the agent stays a drop-in                                            |
-| `GET`  | `/health`    | additive diagnostics: running version, origin posture, and **every** discovered queue with its health verdict             |
+| Method | Path          | Response                                                                                                                 |
+| ------ | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `GET`  | `/available`  | `{"printer": [Device, …]}` — only queues that can actually print, USB before network, inside a 1500 ms probe budget       |
+| `GET`  | `/default`    | one `Device` object, or an **empty body** when nothing is healthy (an empty JSON object here would break callers)         |
+| `POST` | `/write`      | spools `{"data": "<raw ZPL>"}` to the requested (or resolved) printer; empty `200` on success, plain-text body on failure |
+| `POST` | `/read`       | empty `200` — dead surface for most callers, kept so the agent stays a drop-in                                            |
+| `GET`  | `/health`     | **additive** diagnostics: running version, origin posture, and **every** discovered queue with its health verdict         |
+| `POST` | `/print-pdf`  | **additive**: spools `{"data": "<base64 PDF>"}` as a rendered document; same `200`/plain-text convention as `/write`      |
 
 `OPTIONS` on any path answers the CORS preflight with `204`.
+
+**`/print-pdf`.** For callers that render a multi-cell label *sheet* rather than one ZPL label.
+It takes the same `{device, data}` envelope as `/write` and reuses the same printer resolution,
+USB-to-network failover, and origin gating, so a sheet and a label can never disagree about which
+printer is usable. `data` that will not base64-decode, or that decodes to bytes not beginning with
+`%PDF`, is a `400` before any CUPS call; a body over 50 MB is a `413`. Unlike `/write` it spools
+**without `-o raw`**, because CUPS must render the PDF through its filter chain — raw PDF bytes
+would reach the device unrendered and print as garbage.
 
 **Ports.** `9100` is plain HTTP; loopback is exempt from mixed-content blocking, so
 Chromium-family browsers reach it directly from an HTTPS page. `9101` is TLS and exists only
@@ -47,8 +59,8 @@ is reported: the `Device` shape must never grow a version field, because callers
 it. A binary built any way other than a tagged release reports `dev`.
 
 **Origin posture.** With no `--origin-allow` configured the agent is `log-and-allow`: every
-origin is recorded and permitted. Configure an allowlist and `/write` rejects any other origin
-with `403` *before* any CUPS work happens.
+origin is recorded and permitted. Configure an allowlist and both print routes — `/write` and
+`/print-pdf` — reject any other origin with `403` *before* any CUPS work happens.
 
 ## Install
 

@@ -11,7 +11,8 @@ report phantom success.
 
 `[[server.go#agent#ServeHTTP]]` routes `GET /available`, `GET /default`, `POST /write`,
 `POST /read` and the `OPTIONS` preflight in exactly the shapes the calling transport parses,
-echoing the request `Origin` back as `Access-Control-Allow-Origin`.
+echoing the request `Origin` back as `Access-Control-Allow-Origin`. Two additive routes sit beside
+them: `GET /health` and `POST /print-pdf` ([[tools#Print Agent#Document Printing]]).
 `[[discovery.go#printer#device]]` shapes each wire `Device`; only `name` and `uid` are
 load-bearing, and `provider` reports `browser-print-agentd`. Ports and bind address come from
 `[[config.go#parseConfig]]` — flag over environment over default — and there is no hand-listed
@@ -30,11 +31,14 @@ Every CUPS call the agent makes goes through `[[cups.go#cupsClient]]`, which is 
 only coupling point: raw queues are gone from macOS and printer drivers are deprecated, so the
 backend has to stay swappable.
 
-`[[cups.go#cupsClient#printRaw]]` always spools with `lp -d <queue> -o raw <file>`. `-o raw` is
-load-bearing rather than an optimization: the hardware spike proved that without it the
+`[[cups.go#cupsClient#printRaw]]` always spools ZPL with `lp -d <queue> -o raw <file>`. `-o raw`
+is load-bearing rather than an optimization: the hardware spike proved that without it the
 `zebra.ppd` filter rasterizes the ZPL into a `~DGR:CUPS.GRF` bitmap (42 source bytes became 5553
 on the wire) and the label prints as a picture of itself — it does not error, it silently prints
-the wrong thing. Queues themselves are created (by the installer, not the agent) with
+the wrong thing. `[[cups.go#cupsClient#printDocument]]` omits `-o raw` for exactly the same
+reason read the other way, and both go through `[[cups.go#cupsClient#spool]]` so only the lp
+options and the temp-file suffix ever differ. Queues themselves are created (by the installer,
+not the agent) with
 `-m drv:///sample.drv/zebra.ppd`, because `lpadmin -m raw` now exits 1 with
 `Raw queues are no longer supported on macOS.` and the `raw  Raw Queue` line `lpinfo -m` still
 prints is vestigial and must never be probed as a capability.
@@ -116,27 +120,62 @@ device. Only when NO printer is healthy does the job fail, with a plain-text non
 surfaces as a send error. The divergence is invisible to the transport, which still just sends
 `{device, data}` and reads a status.
 
+## Document Printing
+
+`[[server.go#agent#handlePrintPDF]]` answers `POST /print-pdf`, taking the same `{device, data}`
+envelope as `/write` with `data` carrying a base64-encoded PDF. It exists for the multi-cell label
+SHEET a caller renders when one ZPL label per print will not do.
+
+**`/print-pdf` must never be given `-o raw`, and this is the one invariant a future editor is
+likely to break.** The two print routes look symmetrical and the temptation to collapse them into
+one lp invocation is real, but the option is correct on exactly one of them. ZPL is
+printer-native, so `-o raw` is what stops the filter chain from rasterizing it. A PDF is the
+opposite: it is not printer-native, CUPS has to render it, and `-o raw` would push the raw PDF
+bytes to the device, which prints them as garbage. Neither mistake produces an error — both
+silently print the wrong thing, the exact failure class this agent was built to eliminate — so
+[[tests#Agent Core#Print PDF Spools A Document Without Raw]] asserts the presence and the absence
+in the same test rather than trusting a comment.
+
+Everything else is deliberately shared rather than duplicated.
+`[[server.go#agent#resolveTarget]]` picks the printer and performs the same USB-to-network
+failover, `[[server.go#agent#enforceOrigin]]` applies the same allowlist, and success is the same
+empty `200` with the same plain-text bodies on failure. Only payload validation is new: a `data`
+field that will not base64-decode, or that decodes to bytes not beginning with `%PDF`, is a `400`
+before any CUPS call, and a body past 50 MB is a `413`. Both refusals are the route declining to
+hand CUPS something it would accept and turn into a wasted page.
+
+The route is ADDITIVE and sits outside the frozen contract in `README.md`: no caller of the five
+frozen routes is affected by its existence, and the `Device` shape does not change. A caller that
+needs to know whether a station has it reads `X-Print-Agent-Version`, which is still the only
+version channel — the route is not advertised through `/available`, so an older agent answers a
+sheet request with the plain-text `404` its default arm has always produced.
+
 ## Origin Posture
 
 The loopback surface has no token, so any page the operator visits could otherwise enumerate
-printers and spool ZPL. v1 accepts that risk only on the condition that it is auditable rather
-than silent.
+printers and spool ZPL or a rendered PDF. v1 accepts that risk only on the condition that it is
+auditable rather than silent.
 
 `[[log.go#agentLogger#request]]` records the `Origin` of every request, and
 `[[log.go#agentLogger#job]]` records each job's outcome with the device uid, byte count, `lp`
 request id, and origin — the minimal audit trail v1 commits to (a formal retention policy is a
 non-goal). `--origin-allow` takes an optional comma-separated allowlist
 (`[[server.go#parseOriginAllow]]`); when it is configured,
-`[[server.go#agent#originAllowed]]` rejects a `/write` from any other origin — including one with
-no `Origin` header — before any `lp` call runs, and logs the rejection. Unconfigured, the
+`[[server.go#agent#originAllowed]]` rejects a print request from any other origin — including one
+with no `Origin` header — before any `lp` call runs, and logs the rejection. Unconfigured, the
 default, every origin is logged and allowed. This is additive to CORS and never changes a
 caller's own successful path.
 
+Both write-capable routes go through the one gate. `[[server.go#agent#enforceOrigin]]` is what
+`/write` and `/print-pdf` share, deliberately rather than incidentally: a second route that
+spools to a printer but skipped the allowlist would make the allowlist bypassable by posting a
+PDF instead of ZPL, so the check is structural and is asserted on both routes.
+
 ## Version And Health Surface
 
-One additive route sits beside the frozen four. `[[version.go#agent#handleHealth]]` answers
-`GET /health` with the running version, the origin posture, and every discovered queue flagged
-healthy or not.
+`[[version.go#agent#handleHealth]]` answers `GET /health` with the running version, the origin
+posture, and every discovered queue flagged healthy or not — the diagnostics half of the two
+additive routes that sit beside the frozen contract.
 
 It is the inverse of `/available`, which hides unhealthy printers so a caller can never pin one,
 where triage needs to see exactly the queue that exists but cannot print. It still answers 200

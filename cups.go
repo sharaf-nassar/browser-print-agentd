@@ -51,6 +51,12 @@ const (
 	// than a health probe: a 4x6 label is ~540 KB of uncompressed ^GFA hex, and
 	// truncating that job would be worse than answering slowly.
 	cupsPrintTimeout = 15 * time.Second
+
+	// Spool-file suffixes. CUPS sniffs content rather than trusting an
+	// extension, so these are for a human reading `ls` on a wedged station's
+	// temp directory, not for the filter chain.
+	zplSuffix = ".zpl"
+	pdfSuffix = ".pdf"
 )
 
 // execResult is the outcome of one external command: CUPS reports state in the
@@ -183,10 +189,32 @@ func (c *cupsClient) deviceURIs(ctx context.Context) ([]queueDevice, error) {
 // `-o raw` is load-bearing, not an optimization: without it the zebra.ppd
 // filter rasterizes the ZPL into a ~DGR:CUPS.GRF bitmap (42 source bytes became
 // 5553 on the wire) and the label prints as a picture of itself. It does not
-// error — it silently prints the wrong thing — so every lp invocation in this
+// error — it silently prints the wrong thing — so every ZPL invocation in this
 // agent carries it.
 func (c *cupsClient) printRaw(ctx context.Context, queue string, data []byte) (string, error) {
-	file, err := os.CreateTemp("", tempPrefix+"-*.zpl")
+	return c.spool(ctx, queue, data, zplSuffix, "-o", "raw")
+}
+
+// printDocument spools data as a DOCUMENT and returns the CUPS request id.
+//
+// The absence of `-o raw` here is the whole point and is exactly as
+// load-bearing as its presence in printRaw. A PDF is not printer-native: CUPS
+// has to run it through its filter chain to turn it into something the device
+// understands, and `-o raw` would hand the raw PDF bytes straight to the
+// printer, which prints them as garbage rather than erroring. Never "unify"
+// these two by giving them the same lp options.
+func (c *cupsClient) printDocument(ctx context.Context, queue string, data []byte) (string, error) {
+	return c.spool(ctx, queue, data, pdfSuffix)
+}
+
+// spool writes data to a temp file with suffix and hands it to `lp -d <queue>`
+// with options, returning the CUPS request id. Both print paths share it so the
+// spool-file lifecycle, the print timeout, and the failure text stay identical
+// no matter what is being printed; only the suffix and the options differ.
+func (c *cupsClient) spool(
+	ctx context.Context, queue string, data []byte, suffix string, options ...string,
+) (string, error) {
+	file, err := os.CreateTemp("", tempPrefix+"-*"+suffix)
 	if err != nil {
 		return "", fmt.Errorf("create spool file: %w", err)
 	}
@@ -200,8 +228,12 @@ func (c *cupsClient) printRaw(ctx context.Context, queue string, data []byte) (s
 		return "", fmt.Errorf("close spool file: %w", err)
 	}
 
-	result, err := c.runFor(
-		ctx, c.printTimeout, cupsPrintTimeout, "lp", "-d", queue, "-o", "raw", path)
+	args := make([]string, 0, len(options)+3)
+	args = append(args, "-d", queue)
+	args = append(args, options...)
+	args = append(args, path)
+
+	result, err := c.runFor(ctx, c.printTimeout, cupsPrintTimeout, "lp", args...)
 	if err != nil {
 		return "", err
 	}

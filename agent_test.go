@@ -15,8 +15,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -172,11 +174,40 @@ func startAgent(t *testing.T, fake *fakeCUPS, originAllow []string) (string, *by
 // postWrite issues a /write with an optional Origin header.
 func postWrite(t *testing.T, base string, origin string, body map[string]any) (int, string) {
 	t.Helper()
+	return postJSON(t, base, "/write", origin, body)
+}
+
+// postPrintPDF issues a /print-pdf with an optional Origin header.
+func postPrintPDF(t *testing.T, base string, origin string, body map[string]any) (int, string) {
+	t.Helper()
+	return postJSON(t, base, "/print-pdf", origin, body)
+}
+
+// postJSON posts an encoded body to path with an optional Origin header, and is
+// what both print routes are driven through so a difference between them is
+// never an artifact of the harness.
+func postJSON(
+	t *testing.T, base string, path string, origin string, body map[string]any,
+) (int, string) {
+	t.Helper()
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
 	}
-	request, err := http.NewRequest(http.MethodPost, base+"/write", bytes.NewReader(encoded))
+	response := postRaw(t, base, path, origin, bytes.NewReader(encoded))
+	defer response.Body.Close()
+	payload := &bytes.Buffer{}
+	payload.ReadFrom(response.Body)
+	return response.StatusCode, payload.String()
+}
+
+// postRaw posts an arbitrary body and hands back the live response so a caller
+// can read headers as well as status. The caller closes the body.
+func postRaw(
+	t *testing.T, base string, path string, origin string, body io.Reader,
+) *http.Response {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, base+path, body)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -186,13 +217,17 @@ func postWrite(t *testing.T, base string, origin string, body map[string]any) (i
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		t.Fatalf("post /write: %v", err)
+		t.Fatalf("post %s: %v", path, err)
 	}
-	defer response.Body.Close()
-	payload := &bytes.Buffer{}
-	payload.ReadFrom(response.Body)
-	return response.StatusCode, payload.String()
+	return response
 }
+
+// samplePDF is a minimal well-formed PDF. Only the leading %PDF signature is
+// load-bearing for the agent — lp is recorded, never executed, so nothing here
+// is ever rendered — but a real document shape keeps the fixture honest about
+// what the route actually carries.
+var samplePDF = []byte("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n" +
+	"trailer\n<< /Root 1 0 R >>\n%%EOF\n")
 
 // getPath issues a GET and returns status plus body.
 func getPath(t *testing.T, base string, path string) (int, string) {
@@ -545,6 +580,253 @@ func TestWriteStreamsLargePayloadsVerbatim(t *testing.T) {
 	// ZPL into a bitmap and the label prints as a picture of itself.
 	if !strings.Contains(strings.Join(calls[0].Args, " "), "-o raw") {
 		t.Fatalf("lp argv = %v, want -o raw on every invocation", calls[0].Args)
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Spools A Document Without Raw]]
+func TestPrintPDFSpoolsADocumentWithoutRaw(t *testing.T) {
+	fake := twoPrinterCUPS(stateEnabled, stateEnabled)
+	base, logs := startAgent(t, fake, nil)
+
+	status, body := postPrintPDF(t, base, "https://lab.example", map[string]any{
+		"device": map[string]any{"uid": stableUID(usbQueue, usbURI), "name": usbQueue},
+		"data":   base64.StdEncoding.EncodeToString(samplePDF),
+	})
+	if status != http.StatusOK || body != "" {
+		t.Fatalf("/print-pdf = %d %q, want 200 and an empty body", status, body)
+	}
+
+	calls := fake.calls()
+	if len(calls) != 1 {
+		t.Fatalf("lp calls = %d, want exactly one", len(calls))
+	}
+	argv := calls[0].Args
+	if len(argv) < 3 || argv[0] != "-d" || argv[1] != usbQueue {
+		t.Fatalf("lp argv = %v, want -d <queue> … <file>", argv)
+	}
+
+	// THE invariant of this route, asserted before anything else about the argv
+	// so a regression reports the reason rather than a shape mismatch. `/write`
+	// must carry `-o raw` so the zebra.ppd filter cannot rasterize ZPL;
+	// `/print-pdf` must NOT, because a PDF is not printer-native and raw bytes
+	// would reach the device unrendered. Neither failure errors — both silently
+	// print the wrong thing — so the option is asserted in both directions.
+	for _, arg := range argv[:len(argv)-1] { // every argument except the spool path
+		if arg == "-o" || arg == "raw" {
+			t.Fatalf("lp argv = %v, want NO -o raw: a PDF must go through the CUPS "+
+				"filter chain or it reaches the device unrendered and prints as garbage",
+				argv)
+		}
+	}
+	if len(argv) != 3 {
+		t.Fatalf("lp argv = %v, want exactly -d <queue> <file>", argv)
+	}
+	if !strings.HasSuffix(argv[2], ".pdf") {
+		t.Fatalf("spool file = %q, want a .pdf suffix", argv[2])
+	}
+	if !bytes.Equal(calls[0].Payload, samplePDF) {
+		t.Fatalf("spooled %d bytes, want the %d-byte decoded PDF verbatim",
+			len(calls[0].Payload), len(samplePDF))
+	}
+	if !strings.Contains(logs.String(), "print-pdf ok bytes=") ||
+		!strings.Contains(logs.String(), "origin=https://lab.example") {
+		t.Fatalf("logs = %q, want an audited print-pdf job line", logs.String())
+	}
+
+	// The sibling route is unchanged and still raw, so the two are proven apart
+	// rather than merely proven individually.
+	rawFake := twoPrinterCUPS(stateEnabled, stateEnabled)
+	rawBase, _ := startAgent(t, rawFake, nil)
+	if status, body := postWrite(t, rawBase, "", map[string]any{"data": "^XA^XZ"}); status != 200 {
+		t.Fatalf("/write = %d %q, want 200", status, body)
+	}
+	if got := strings.Join(rawFake.calls()[0].Args, " "); !strings.Contains(got, "-o raw") {
+		t.Fatalf("/write lp argv = %q, want -o raw still present", got)
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Rejects A Payload That Is Not A PDF]]
+func TestPrintPDFRejectsAPayloadThatIsNotAPDF(t *testing.T) {
+	cases := []struct {
+		name string
+		data any
+		want string
+	}{
+		{"undecodable base64", "not!valid!base64!", "base64"},
+		{"decodes but is not a PDF", base64.StdEncoding.EncodeToString(
+			[]byte("<html>a rendering bug produced this</html>")), pdfMagic},
+		{"empty payload", "", pdfMagic},
+		{"no data field", nil, "data"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fake := twoPrinterCUPS(stateEnabled, stateEnabled)
+			base, _ := startAgent(t, fake, nil)
+
+			body := map[string]any{"device": map[string]any{"name": usbQueue}}
+			if testCase.data != nil {
+				body["data"] = testCase.data
+			}
+			status, text := postPrintPDF(t, base, "", body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("/print-pdf = %d %q, want 400", status, text)
+			}
+			if !strings.Contains(text, testCase.want) {
+				t.Fatalf("/print-pdf body = %q, want plain text naming %q",
+					text, testCase.want)
+			}
+			// Validation happens before any CUPS work: a bad payload must never
+			// reach a printer, because CUPS would accept it and put garbage on
+			// media rather than fail.
+			if calls := fake.calls(); len(calls) != 0 {
+				t.Fatalf("lp calls = %v, want none for a rejected payload", calls)
+			}
+		})
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Caps The Body At Fifty Megabytes]]
+func TestPrintPDFCapsTheBodyAtFiftyMegabytes(t *testing.T) {
+	fake := twoPrinterCUPS(stateEnabled, stateEnabled)
+	base, _ := startAgent(t, fake, nil)
+
+	// Just past the cap once the JSON envelope is counted, so the limit is
+	// exercised at its edge rather than with an arbitrarily huge body. Streamed
+	// rather than concatenated so the fixture does not need a second 50 MB copy.
+	oversized := io.MultiReader(
+		strings.NewReader(`{"data":"`),
+		strings.NewReader(strings.Repeat("A", maxPDFBody)),
+		strings.NewReader(`"}`),
+	)
+	response := postRaw(t, base, "/print-pdf", "", oversized)
+	defer response.Body.Close()
+	payload := &bytes.Buffer{}
+	payload.ReadFrom(response.Body)
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("/print-pdf oversize = %d %q, want 413",
+			response.StatusCode, payload.String())
+	}
+	if !strings.Contains(payload.String(), "too large") {
+		t.Fatalf("413 body = %q, want a plain-text reason", payload.String())
+	}
+	// The cap is enforced before decoding, so an abusive body never gets spooled.
+	if calls := fake.calls(); len(calls) != 0 {
+		t.Fatalf("lp calls = %v, want none for an oversize body", calls)
+	}
+
+	// A document comfortably inside the cap still prints.
+	status, body := postPrintPDF(t, base, "", map[string]any{
+		"data": base64.StdEncoding.EncodeToString(samplePDF),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("/print-pdf under the cap = %d %q, want 200", status, body)
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Shares Write Failover And Origin Gating]]
+func TestPrintPDFSharesWriteFailoverAndOriginGating(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString(samplePDF)
+	pinnedUID := stableUID(usbQueue, usbURI)
+
+	// Failover: the pinned USB printer died between listing and printing, so the
+	// sheet goes to the healthy network printer and the skip is named out loud —
+	// identical to /write, because it is literally the same resolveTarget call.
+	fake := twoPrinterCUPS(stateDisabled, stateEnabled)
+	base, logs := startAgent(t, fake, nil)
+	status, body := postPrintPDF(t, base, "", map[string]any{
+		"device": map[string]any{"uid": pinnedUID, "name": usbQueue},
+		"data":   encoded,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("/print-pdf = %d %q, want 200 via failover", status, body)
+	}
+	calls := fake.calls()
+	if len(calls) != 1 || calls[0].Args[1] != netQueue {
+		t.Fatalf("lp argv = %v, want the network queue", calls)
+	}
+	if !strings.Contains(logs.String(), "print-pdf fallback requested="+pinnedUID) {
+		t.Fatalf("logs = %q, want an explicit print-pdf fallback line", logs.String())
+	}
+
+	// No healthy printer fails exactly as loudly as /write does: a plain-text
+	// non-2xx and no lp call at all, never a phantom "Sent".
+	dead := twoPrinterCUPS(stateDisabled, stateRejecting)
+	deadBase, _ := startAgent(t, dead, nil)
+	status, body = postPrintPDF(t, deadBase, "", map[string]any{"data": encoded})
+	if status < 400 {
+		t.Fatalf("/print-pdf on a dead station = %d, want a non-2xx", status)
+	}
+	if !strings.Contains(body, "usable") && !strings.Contains(body, "healthy") {
+		t.Fatalf("/print-pdf body = %q, want a plain-text reason", body)
+	}
+	if calls := dead.calls(); len(calls) != 0 {
+		t.Fatalf("lp calls = %v, want none — a dead station must not spool", calls)
+	}
+
+	// Origin gate: a write-capable route that skipped the allowlist would let a
+	// hostile page print by posting a PDF instead of ZPL, so /print-pdf is gated
+	// exactly as /write is and rejects before any CUPS work.
+	gated := twoPrinterCUPS(stateEnabled, stateEnabled)
+	gatedBase, gatedLogs := startAgent(t, gated, []string{"https://lab.example"})
+	job := map[string]any{"data": encoded}
+	status, body = postPrintPDF(t, gatedBase, "https://evil.example", job)
+	if status != http.StatusForbidden {
+		t.Fatalf("/print-pdf from a disallowed origin = %d %q, want 403", status, body)
+	}
+	if !strings.Contains(body, "evil.example") {
+		t.Fatalf("rejection body = %q, want a plain-text reason naming the origin", body)
+	}
+	if calls := gated.calls(); len(calls) != 0 {
+		t.Fatalf("lp calls = %v, want none for a rejected origin", calls)
+	}
+	if !strings.Contains(gatedLogs.String(), "print-pdf REJECTED reason=origin-not-allowed") {
+		t.Fatalf("logs = %q, want the print-pdf rejection recorded", gatedLogs.String())
+	}
+	// A request with no Origin header is on no allowlist either.
+	if status, _ = postPrintPDF(t, gatedBase, "", job); status != http.StatusForbidden {
+		t.Fatalf("/print-pdf with no Origin under an allowlist = %d, want 403", status)
+	}
+	// The allowed origin prints normally.
+	if status, body = postPrintPDF(t, gatedBase, "https://lab.example", job); status != 200 {
+		t.Fatalf("/print-pdf from an allowed origin = %d %q, want 200", status, body)
+	}
+
+	// CORS and the version header behave on the new route exactly as everywhere
+	// else, error paths included — a browser that cannot read the 400 sees an
+	// opaque network failure instead of the reason.
+	open := twoPrinterCUPS(stateEnabled, stateEnabled)
+	openBase, _ := startAgent(t, open, nil)
+	bad := postRaw(t, openBase, "/print-pdf", "https://lab.example",
+		strings.NewReader(`{"data":"@@@"}`))
+	defer bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("/print-pdf bad base64 = %d, want 400", bad.StatusCode)
+	}
+	if got := bad.Header.Get("Access-Control-Allow-Origin"); got != "https://lab.example" {
+		t.Fatalf("Allow-Origin on the 400 = %q, want the echoed origin", got)
+	}
+	if got := bad.Header.Get(versionHeader); got != version {
+		t.Fatalf("%s on the 400 = %q, want %q", versionHeader, got, version)
+	}
+
+	preflight, err := http.NewRequest(http.MethodOptions, openBase+"/print-pdf", nil)
+	if err != nil {
+		t.Fatalf("build preflight: %v", err)
+	}
+	preflight.Header.Set("Origin", "https://lab.example")
+	response, err := http.DefaultClient.Do(preflight)
+	if err != nil {
+		t.Fatalf("preflight /print-pdf: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("/print-pdf preflight = %d, want 204", response.StatusCode)
+	}
+	if got := response.Header.Get("Access-Control-Allow-Origin"); got != "https://lab.example" {
+		t.Fatalf("preflight Allow-Origin = %q, want the echoed origin", got)
+	}
+	if got := response.Header.Get(versionHeader); got != version {
+		t.Fatalf("preflight %s = %q, want %q", versionHeader, got, version)
 	}
 }
 

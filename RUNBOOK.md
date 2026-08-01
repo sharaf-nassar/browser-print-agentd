@@ -164,8 +164,9 @@ that warning; re-running the installer is the supported repair.
 ### Per-station configuration
 
 `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist` is the only
-configuration surface. Ports and bind address live in `ProgramArguments`; to lock `/write` to one
-origin, append two more strings — `--origin-allow` and the allowed origin — then reload:
+configuration surface. Ports and bind address live in `ProgramArguments`; to lock the print routes
+(`/write` and `/print-pdf`) to one origin, append two more strings — `--origin-allow` and the
+allowed origin — then reload:
 
 ```bash
 sudo launchctl bootout gui/$(id -u)/io.github.sharaf-nassar.browser-print-agentd
