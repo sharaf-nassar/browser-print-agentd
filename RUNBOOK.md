@@ -29,25 +29,82 @@ zero network egress. Manual rollback remains one package install after pinning t
 Every release keeps its own installer, so any previously shipped version stays downloadable
 forever. That retention is the precondition for the rollback path.
 
-Releases are published by `.github/workflows/release.yml` under the tag that built them, and the
-asset is named for its version:
+Releases are published by `.github/workflows/release.yml` under the tag that built them. Every
+release carries the installer twice: once under a name that carries its version, and once under a
+version-free name that never changes.
 
-| Tag      | Release asset                       |
-| -------- | ----------------------------------- |
-| `v1.4.0` | `browser-print-agentd-1.4.0.pkg`    |
-| `v1.3.0` | `browser-print-agentd-1.3.0.pkg`    |
+| Tag      | Versioned installer              | Evergreen copy              |
+| -------- | -------------------------------- | --------------------------- |
+| `v1.4.0` | `browser-print-agentd-1.4.0.pkg` | `browser-print-agentd.pkg`  |
+| `v1.3.0` | `browser-print-agentd-1.3.0.pkg` | `browser-print-agentd.pkg`  |
 
-Three properties hold, and the release workflow enforces them rather than relying on convention:
+The two files are byte-identical; only the asset name differs. Use the versioned one for
+anything where the build matters — installs you are recording, rollbacks, incident forensics. The
+evergreen copy exists for the download link described below.
 
-- **The version is in the filename.** The workflow asserts the asset is exactly
+Four properties hold, and the release workflow enforces them rather than relying on convention:
+
+- **The version is in the filename.** The workflow asserts the versioned asset is exactly
   `browser-print-agentd-<version>.pkg` before uploading, so a downloaded installer is never
   ambiguous about which build it carries.
 - **A release asset is scoped to its own tag.** The upload uses `--clobber` so that re-running a
-  release for the _same_ tag replaces its own asset instead of failing; a different tag is a
-  different release with a differently named asset, so no prior installer can be overwritten.
+  release for the _same_ tag replaces its own assets instead of failing. Assets belong to one
+  release, so uploading under one tag can never touch another's — including the evergreen copy,
+  which repeats its name on every release but is a separate file on each.
+- **The evergreen copy is unconditional.** It is not gated on a tag pattern, a workflow input, or
+  a manual step; the copy step has no `if:` at all, so even a dry run exercises it. The workflow
+  checks it is byte-identical to the versioned installer and revalidates the stapled notarization
+  ticket on the copy itself before uploading.
 - **Nothing deletes.** The workflow never calls `gh release delete` or `gh release delete-asset`,
-  and it prints the previous release's installer and download URL into its own job summary as the
-  named rollback target for the build it just shipped.
+  and it prints the previous release's _versioned_ installer and download URL into its own job
+  summary as the named rollback target for the build it just shipped.
+
+### The evergreen installer link
+
+`browser-print-agentd.pkg` is a **public contract with a downstream consumer, not an internal
+convenience.** Do not rename it, and do not ship a release without it.
+
+GitHub serves a version-free redirect for whichever release is marked latest:
+
+```text
+https://github.com/sharaf-nassar/browser-print-agentd/releases/latest/download/browser-print-agentd.pkg
+```
+
+That URL answers `302` and lands on the newest release's notarized installer. The
+operator-facing web app that drives these stations embeds it verbatim: when its print surface
+finds no agent on a Mac, the only remedy it can offer the operator is that one link. A rename or
+a missing asset turns it into a `404` on exactly the stations that cannot print until they get
+it — and the operator hitting it is typically not the admin who could work around it.
+
+Consequences worth knowing before you touch a release:
+
+- **`releases/latest` excludes drafts and prereleases.** A release left in draft, or marked as a
+  prerelease, is invisible to the link — it will keep resolving to the previous release. The
+  workflow marks a release `--latest` explicitly, and only after all four assets are attached, so
+  the link never resolves to a release that is still missing its installer.
+- **Hand-editing a release can break the link.** Deleting the evergreen asset from the newest
+  release, or unmarking that release as latest, breaks it without breaking anything else you
+  would notice. Nothing in the workflow deletes assets; only a human can.
+- **The updater does not use this link.** The root updater daemon reads
+  `latest/download/update-manifest.txt`, and the manifest names the *versioned* asset, which it
+  then fetches by name. Automatic updates therefore keep working even if the evergreen copy is
+  missing — which is precisely why its absence is easy to miss. Check for it explicitly.
+
+**Owner: the maintainer of this repository.** The obligation lives with the release workflow, and
+the same note is written at the copy step in `.github/workflows/release.yml`. Removing or
+renaming the asset is a breaking change for the consuming app and has to be coordinated with it
+first.
+
+Verify the link after any release, from a logged-out shell (an authenticated `curl` is a
+different code path):
+
+```bash
+env -u GITHUB_TOKEN -u GH_TOKEN curl -sIL \
+  https://github.com/sharaf-nassar/browser-print-agentd/releases/latest/download/browser-print-agentd.pkg \
+  | grep -Ei '^(HTTP/|location:)'
+```
+
+Expect a `302` chain ending in `200`, with a `location:` naming the newest release's `.pkg`.
 
 List what is currently downloadable:
 

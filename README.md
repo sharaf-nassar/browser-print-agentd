@@ -220,13 +220,20 @@ Releases are cut by tagging `v*.*.*` (`v0.1.0`, `v0.2.0`, …). Pushing the tag 
    verifies with `spctl` that Gatekeeper reports `Notarized Developer ID`;
 4. self-verifies that the packaged binary reports the tagged version on both `GET /health` and
    `X-Print-Agent-Version`, and that the asset name carries that version;
-5. attaches `browser-print-agentd-<version>.pkg`, its `.sha256`, and
-   `update-manifest.txt` to the GitHub release, marks that release latest explicitly, and records
-   the previous release as the documented rollback target.
+5. attaches `browser-print-agentd-<version>.pkg`, a byte-identical copy of it named
+   `browser-print-agentd.pkg`, its `.sha256`, and `update-manifest.txt` to the GitHub release,
+   marks that release latest explicitly, and records the previous release as the documented
+   rollback target.
 
 Nothing in that workflow deletes a tag, a release, or an asset — every shipped `.pkg` stays
 independently downloadable, because rollback is exactly one step: install the previous release's
 `.pkg` over the bad one.
+
+The version-free `browser-print-agentd.pkg` is the **evergreen download contract**: it makes
+`…/releases/latest/download/browser-print-agentd.pkg` a permanent 302 to the newest release's
+notarized installer, which is the install link a downstream operator-facing app hands a station
+that has no agent yet. It is attached unconditionally on every release and must not be renamed or
+dropped — see `RUNBOOK.md`, "The evergreen installer link".
 
 Secrets the workflow needs:
 

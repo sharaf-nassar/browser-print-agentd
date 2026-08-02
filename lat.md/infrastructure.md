@@ -192,9 +192,9 @@ gating nothing automatically.
 
 ### Asset Retention
 
-The installer asset is named `browser-print-agentd-<version>.pkg`, so every release keeps its own
-installer and no prior notarized `.pkg` is ever overwritten. That is the retention half of the
-documented downgrade path.
+The versioned installer asset is named `browser-print-agentd-<version>.pkg`, so every release
+keeps its own installer and no prior notarized `.pkg` is ever overwritten. That is the retention
+half of the documented downgrade path.
 
 The exact name is asserted before upload rather than trusted to convention, because an
 unversioned asset would make a downloaded installer ambiguous about which build it carries. One
@@ -223,8 +223,39 @@ Retention is only real if a run proves it, so the run that ships a build also na
 station falls back to: after upload the previous `v*` release is read back and its installer and
 download URL recorded as this release's rollback target — the input
 [[operations#Station Operations#Rollback Path]] consumes, and the reason retention is a gate rather
-than a habit. Nothing in the path deletes, and a
-`--clobber` on the upload can only ever replace the three assets of the tag being released, since
-a different tag is a different release. A prior release with no `.pkg` warns rather than fails —
-the package just shipped is already published and notarized, and failing there would report a bad
-release for a defect in an older one.
+than a habit. That lookup selects the previous release's **versioned** `.pkg` and explicitly
+excludes the [[infrastructure#Release Chain#Evergreen Download Asset|evergreen copy]]: a release
+carries two `.pkg` assets, and a version-free filename names no build, so an `endswith(".pkg")`
+match alone could report a rollback target that tells an operator nothing. Nothing in the path
+deletes, and a `--clobber` on the upload can only ever replace the four assets of the tag being
+released, since a different tag is a different release. A prior release with no versioned `.pkg`
+warns rather than fails — the package just shipped is already published and notarized, and
+failing there would report a bad release for a defect in an older one.
+
+### Evergreen Download Asset
+
+Every release also attaches the notarized installer a second time as `browser-print-agentd.pkg`,
+a byte-identical copy under a version-free name. It is a public cross-project contract, and no
+release may ship without it.
+
+A downstream consumer — the operator-facing web app whose print surface talks to this agent —
+hands a station with no agent installed a single `releases/latest/download/browser-print-agentd.pkg`
+link. GitHub answers that with a 302 to whichever release is currently marked latest, so the URL
+never has to be edited for a new version. That redirect ignores drafts and prereleases, which is
+why the release is marked `--latest` only after all four assets are attached: the link must never
+resolve to a release that is still missing its installer. Renaming the asset, or shipping without
+it, 404s the only install route offered to a station that cannot print until it gets one.
+
+The obligation is unconditional by construction. The copy step carries no `if:`, so no tag
+pattern, workflow input, or manual gate can turn it off, and a `workflow_dispatch` dry run
+exercises it too. The name comes from `packaging/identity.sh` rather than a workflow literal, so
+it moves with a product rename like every other identity-derived string. The copy is taken after
+notarization, stapling and the quarantined Gatekeeper verdict, and the workflow then compares its
+SHA-256 against the versioned package and revalidates the stapled ticket on the copy itself —
+this is the file an operator actually downloads, so it is checked as such rather than assumed
+correct because `cp` returned zero.
+
+The updater does not consume this asset. It reads `update-manifest.txt`, which names the
+versioned package, so automatic updates keep working with the evergreen copy missing — which is
+exactly what makes its absence easy to miss and why `RUNBOOK.md` documents an explicit
+logged-out check after every release.

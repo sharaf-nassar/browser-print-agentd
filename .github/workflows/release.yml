@@ -20,6 +20,12 @@
 # there instead of drifting silently against a workflow literal that still
 # predicts the old asset name.
 #
+# Every release attaches FOUR assets: the versioned installer, a byte-identical
+# copy of it under a version-free name, the installer's `.sha256`, and
+# `update-manifest.txt`. The version-free copy is the evergreen download
+# contract described at "Copy the notarized package to the stable download
+# name" below — it is unconditional, and no release may ship without it.
+#
 # The hard gate is `ci.yml`, called as a reusable workflow: no `.pkg` may be
 # signed, let alone published, unless the darwin/arm64 cross-build, the Go unit
 # suite, the repository hygiene gate and the `lat check` link check are green on
@@ -176,6 +182,12 @@ jobs:
           # something else fails the release instead of shipping quietly.
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "PKG_PATH=$RUNNER_TEMP/release/$BINARY_NAME-$VERSION.pkg" >> "$GITHUB_ENV"
+          # The evergreen download name: version-free by definition, so the
+          # `releases/latest/download/` URL that resolves to it never has to be
+          # edited. Derived from the same identity string as everything else, so
+          # a product rename moves it too. See "Copy the notarized package to
+          # the stable download name" below for the contract it carries.
+          echo "STABLE_PKG_PATH=$RUNNER_TEMP/release/$BINARY_NAME.pkg" >> "$GITHUB_ENV"
           echo "CHECKSUM_PATH=$RUNNER_TEMP/release/$BINARY_NAME-$VERSION.pkg.sha256" >> "$GITHUB_ENV"
           echo "MANIFEST_PATH=$RUNNER_TEMP/release/update-manifest.txt" >> "$GITHUB_ENV"
           echo "releasing $BINARY_NAME $VERSION" >> "$GITHUB_STEP_SUMMARY"
@@ -483,6 +495,63 @@ jobs:
           fi
           echo "metadata assets: $CHECKSUM_ASSET, $MANIFEST_ASSET"
 
+      # The evergreen download contract — a PUBLIC, CROSS-PROJECT PROMISE, not
+      # an implementation detail of this workflow.
+      #
+      # A separate consumer (the install gate in the operator-facing web app
+      # that drives these stations) links an operator whose Mac has no agent
+      # straight at
+      #   <releases base>/latest/download/<PRODUCT_NAME>.pkg
+      # GitHub answers that URL with a 302 to whichever release is currently
+      # marked `--latest` — drafts and prereleases are excluded from that
+      # redirect, which is why the release below is marked latest only after
+      # every asset is attached. That link is the ONLY install route offered to
+      # a station that cannot print until it gets one, so renaming this asset,
+      # or shipping a release without it, 404s the download on exactly the
+      # machines that need it most.
+      #
+      # OWNER: the maintainer of this repository. The obligation is permanent
+      # and unconditional — every release attaches this asset. There is no tag
+      # pattern, workflow input, or manual step that can turn it off, and this
+      # step is deliberately NOT `if:`-gated, so a `workflow_dispatch` dry run
+      # exercises it as well. Dropping or renaming it is a breaking change for
+      # that consumer and has to be coordinated with it first. The same
+      # obligation is written down for admins in RUNBOOK.md, "The evergreen
+      # installer link".
+      #
+      # The name is derived from packaging/identity.sh rather than written out
+      # here, so a product rename stays the one-line edit that file promises.
+      # The copy is taken after notarization, stapling and the quarantined
+      # Gatekeeper verdict, so it carries the same stapled ticket; the digest
+      # comparison proves the two files are byte-identical rather than assuming
+      # `cp` did what it was asked.
+      - name: Copy the notarized package to the stable download name
+        run: |
+          set -euo pipefail
+          STABLE_ASSET=$(basename "$STABLE_PKG_PATH")
+          PKG_ASSET=$(basename "$PKG_PATH")
+          if [ "$STABLE_ASSET" != "$BINARY_NAME.pkg" ]; then
+            echo "::error::stable asset is named $STABLE_ASSET, not $BINARY_NAME.pkg; the evergreen download link resolves to that exact name"
+            exit 1
+          fi
+          if [ "$STABLE_ASSET" = "$PKG_ASSET" ]; then
+            echo "::error::the stable asset name collides with the versioned one; a release must carry both"
+            exit 1
+          fi
+          cp -p "$PKG_PATH" "$STABLE_PKG_PATH"
+          VERSIONED_SHA256=$(shasum -a 256 "$PKG_PATH" | awk '{print $1}')
+          STABLE_SHA256=$(shasum -a 256 "$STABLE_PKG_PATH" | awk '{print $1}')
+          if [ "$STABLE_SHA256" != "$VERSIONED_SHA256" ]; then
+            echo "::error::$STABLE_ASSET is not byte-identical to $PKG_ASSET"
+            exit 1
+          fi
+          # The ticket travels with the file, but assert it on the copy anyway:
+          # this is the artifact an operator actually downloads.
+          xcrun stapler validate -v "$STABLE_PKG_PATH"
+          echo "stable asset: $STABLE_ASSET (byte-identical copy of $PKG_ASSET)"
+          echo "✅ evergreen asset $STABLE_ASSET is a stapled copy of $PKG_ASSET" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Attach the notarized package and metadata to the tagged release
         if: github.ref_type == 'tag'
         env:
@@ -497,19 +566,28 @@ jobs:
               --title "$TAG_NAME" \
               --notes "Notarized macOS installer for browser-print-agentd. Install the .pkg on the station Mac; the agent reports $VERSION on GET /health and the X-Print-Agent-Version header. To roll a station back to an earlier build, install that release's .pkg over this one — see README.md."
           fi
-          # --clobber so a re-run of the same tag replaces its own asset rather
-          # than failing; a different tag is a different release and a
-          # differently-named asset, so no prior installer is ever overwritten.
-          # Nothing in this workflow deletes: there is no `gh release delete` and
-          # no `gh release delete-asset` anywhere in it, by design.
+          # --clobber so a re-run of the same tag replaces its own assets rather
+          # than failing. Assets are scoped to their own release, so uploading
+          # here can never touch another tag's: the versioned installer is
+          # uniquely named anyway, and the evergreen copy — which repeats its
+          # name on every release by design — is a distinct asset of each
+          # release rather than a shared one. No prior installer is ever
+          # overwritten. Nothing in this workflow deletes: there is no
+          # `gh release delete` and no `gh release delete-asset` anywhere in it,
+          # by design.
           gh release upload "$TAG_NAME" \
-            "$PKG_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH" --clobber
+            "$PKG_PATH" "$STABLE_PKG_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH" \
+            --clobber
           # Publish the stable feed only after every asset is attached. This is
-          # explicit rather than GitHub's date/version-based latest selection.
+          # explicit rather than GitHub's date/version-based latest selection,
+          # and it is what repoints both `latest/download/update-manifest.txt`
+          # for the updater and `latest/download/<product>.pkg` for the
+          # evergreen install link — neither should ever resolve to a release
+          # that is still missing an asset.
           gh release edit "$TAG_NAME" --latest
           gh release view "$TAG_NAME" --json assets \
             --jq '.assets[] | "\(.name)\t\(.size) bytes"'
-          echo "✅ published $(basename "$PKG_PATH"), $(basename "$CHECKSUM_PATH"), and $(basename "$MANIFEST_PATH") on $TAG_NAME" \
+          echo "✅ published $(basename "$PKG_PATH"), $(basename "$STABLE_PKG_PATH"), $(basename "$CHECKSUM_PATH"), and $(basename "$MANIFEST_PATH") on $TAG_NAME" \
             >> "$GITHUB_STEP_SUMMARY"
 
       # Retention is only real if it is checked, so the run that ships a build
@@ -537,11 +615,20 @@ jobs:
             echo "ℹ️ rollback target: none — first release" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # Every release now carries TWO .pkg assets — the versioned installer
+          # and the evergreen copy — so `endswith(".pkg")` alone is ambiguous
+          # and would happily name the version-free copy as the rollback
+          # target. That would be actively misleading: the whole point of a
+          # rollback target is a filename that says which build it is, and the
+          # stable name says nothing. Exclude it by name, leaving only the
+          # versioned installer. `.pkg.sha256` never matches either way.
+          STABLE_ASSET=$(basename "$STABLE_PKG_PATH")
+          export STABLE_ASSET
           PREV_ASSET=$(gh release view "$PREV" --json assets \
-            --jq '.assets[] | select(.name | endswith(".pkg")) | .name' | head -1 || true)
+            --jq '.assets[] | select((.name | endswith(".pkg")) and .name != env.STABLE_ASSET) | .name' | head -1 || true)
           if [ -z "$PREV_ASSET" ]; then
-            echo "::warning::$PREV has no .pkg asset; a station on $VERSION has no one-step rollback to it"
-            echo "⚠️ rollback target $PREV has no .pkg asset" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::$PREV has no versioned .pkg asset; a station on $VERSION has no one-step rollback to it"
+            echo "⚠️ rollback target $PREV has no versioned .pkg asset" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           export PREV_ASSET
