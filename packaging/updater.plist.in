@@ -7,13 +7,11 @@
   __UPDATER_PLIST_PATH__. This is deliberately separate from the per-user
   LaunchAgent: only this process has network egress or installation privilege.
 
-  RunAtLoad covers a reboot. This release-validation build checks every 60
-  seconds and adds up to 5 seconds of jitter before its network request, so a
-  newly published release should be detected within about 65 seconds. Restore
-  StartInterval to 86400 and updater jitter to 0-900 seconds for production.
-  KeepAlive is intentionally absent; a fresh process reads the currently
-  installed script on every run and cannot be killed by its own package
-  replacement.
+  RunAtLoad covers a reboot. Production checks run every 86400 seconds and the
+  updater adds up to 900 seconds (15 minutes) of jitter before its network
+  request. KeepAlive is intentionally absent; a fresh process reads the
+  currently installed script on every run and cannot be killed by its own
+  package replacement.
 -->
 <plist version="1.0">
 <dict>
@@ -35,7 +33,7 @@
 	<true/>
 
 	<key>StartInterval</key>
-	<integer>60</integer>
+	<integer>86400</integer>
 
 	<key>ProcessType</key>
 	<string>Background</string>

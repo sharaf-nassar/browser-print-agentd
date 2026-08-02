@@ -182,16 +182,17 @@ diagnosis so the next reader does not go hunting for a `KeepAlive` variant that 
 The updater is a separate, short-lived root LaunchDaemon; the print agent remains an unprivileged
 per-user LaunchAgent with no egress or update routes.
 
-`${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load. Release validation
-temporarily uses a 60-second `StartInterval` with 0-5 seconds of script-level jitter, so the
-maximum expected detection time is about 65 seconds under normal launchd scheduling. The final
-production release restores an 86400-second interval and 0-900 seconds of jitter. It has no
-`KeepAlive`. Every check therefore starts from the script currently on disk, and `postinstall`
-never boots out an already registered updater: a package replacement cannot kill the process that
-invoked `installer`. Bootstrap happens only after the print agent's own health probe, preserves
-launchd's disabled override, and uses an install marker plus the updater's `installer`-process
-check to prevent the RunAtLoad execution from nesting inside the package installation that
-registered it.
+`${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load and every 86400 seconds,
+with 0-900 seconds (up to 15 minutes) of script-level jitter. The `v0.3.0` release-validation
+baseline temporarily used a 60-second interval and 0-5 seconds of jitter; `v0.3.1` restores these
+production values. It has no `KeepAlive`. Every check therefore starts from the script currently
+on disk, and `postinstall` never boots out an already registered updater: a package replacement
+cannot kill the process that invoked `installer`. Consequently, automatic installation of
+`v0.3.1` replaces the plist but the loaded `v0.3.0` job retains its 60-second interval until a
+reboot or explicit system-domain bootout/bootstrap. Bootstrap happens only after the print
+agent's own health probe, preserves launchd's disabled override, and uses an install marker plus
+the updater's `installer`-process check to prevent the RunAtLoad execution from nesting inside the
+package installation that registered it.
 
 The system support directory is root-owned mode 755 solely to provide traversal to one sanitized,
 root-owned mode-644 status file. Its `updater/` child remains mode 700 and holds the detailed

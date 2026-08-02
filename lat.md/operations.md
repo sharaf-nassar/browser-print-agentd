@@ -111,10 +111,13 @@ The updater is a POSIX shell script shipped as a `packaging/*.in` template rende
 `packaging/identity.sh` — the same convention as `launcher.sh.in`
 ([[packaging#Packaging#Packaging Identity#Rendered Packaging Templates]]) — installed under
 `libexec/` and run by its own root LaunchDaemon label in the system domain with `RunAtLoad`.
-Release validation temporarily uses a 60-second `StartInterval` and 0-5 seconds of per-run jitter,
-giving about 65 seconds as the maximum expected detection time under normal launchd scheduling.
-The final production release restores an 86400-second interval and 0-900 seconds of jitter.
-Short-lived runs mean each exec of whatever is on disk, so the classic self-update race — a
+Production uses an 86400-second `StartInterval` and 0-900 seconds (up to 15 minutes) of per-run
+jitter. The `v0.3.0` release-validation baseline temporarily used a 60-second interval and 0-5
+seconds of jitter so `v0.3.1` could prove automatic replacement without a day-long wait; `v0.3.1`
+restores the production values. An automatic install replaces the plist but deliberately leaves
+the updater that invoked it loaded, so launchd retains `v0.3.0`'s 60-second schedule until reboot
+or an explicit system-domain bootout/bootstrap. Short-lived runs mean each exec of whatever is on
+disk, so the classic self-update race — a
 postinstall booting out the process that spawned `installer` — cannot occur, and
 [[packaging#Packaging#Station Installer#The launchd On-Demand Gate]] does not apply to it, being
 a `gui`-domain condition on a job the system domain never sees.

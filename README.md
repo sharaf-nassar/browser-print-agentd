@@ -112,12 +112,12 @@ Installed layout:
 | `/Library/Application Support/browser-print-agentd/updater/`                       | updater cache and state           |
 | `/Library/Logs/browser-print-agentd/update.log`                                    | updater verification/install log |
 
-This release-validation build temporarily wakes the updater at load and every 60 seconds, with
-0-5 seconds of per-run jitter, then exits after one check. Under normal launchd scheduling, a
-newly published latest release should be detected within about 65 seconds; download,
-verification, and installation add time. Restore the production cadence to an 86400-second
-`StartInterval` with 0-900 seconds of jitter for the final release. The updater does nothing
-without a console user. A strict three-line manifest at GitHub's
+The updater wakes at load and every 86400 seconds, adds 0-900 seconds (up to 15 minutes) of
+per-run jitter, then exits after one check. The `v0.3.0` release-validation baseline alone used a
+60-second interval with 0-5 seconds of jitter; `v0.3.1` restores these production values. When
+`v0.3.0` automatically installs `v0.3.1`, launchd keeps the already loaded 60-second schedule
+until a reboot or an explicit updater bootout/bootstrap, even though the plist on disk contains
+86400. The updater does nothing without a console user. A strict three-line manifest at GitHub's
 `releases/latest/download` feed is authoritative: any version difference triggers an install,
 including a downgrade when a bad latest release is yanked. Before replacement it caches and
 verifies the currently installed release package; an install or version-probe failure restores

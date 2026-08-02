@@ -185,12 +185,11 @@ that warning; re-running the installer is the supported repair.
 
 ## Managing automatic updates
 
-The package ships a short-lived root updater. For release-to-release validation, this build
-temporarily runs at load and every 60 seconds, adds 0-5 seconds of jitter, performs one check, and
-exits. Under normal launchd scheduling, a newly published latest release should be detected within
-about 65 seconds; download, verification, and installation add time. It skips when no station
+The package ships a short-lived root updater. It runs at load and every 86400 seconds, adds 0-900
+seconds (up to 15 minutes) of jitter, performs one check, and exits. It skips when no station
 account is logged in at the console because the package's own `postinstall` needs that account.
-Restore the final production release to an 86400-second `StartInterval` and 0-900 seconds of jitter.
+The `v0.3.0` release-validation baseline temporarily used a 60-second interval and 0-5 seconds of
+jitter; `v0.3.1` restores the production cadence described here.
 
 The updater downloads the strict `update-manifest.txt` asset from the GitHub latest-release URL.
 The manifest names one version, package asset, and SHA-256 digest. Its version is compared with the
@@ -222,7 +221,7 @@ and keeps the cache, quarantine list, signing identity, and updater controls roo
 Use this checklist to prove the accelerated baseline installs its production-cadence successor
 without a manual kickstart, then leave the station running the production cadence.
 
-1. Install the accelerated baseline release manually while the station account is logged in.
+1. Install the accelerated `v0.3.0` baseline manually while the station account is logged in.
    Confirm its version and that the updater is enabled:
 
    ```bash
@@ -236,8 +235,8 @@ without a manual kickstart, then leave the station running the production cadenc
 
    Expect a 60-second loaded interval and no true disabled override.
 
-2. In the successor release, restore `StartInterval` to 86400 and jitter to 0-900 seconds. Publish
-   that signed, notarized release and mark it latest.
+2. Publish signed, notarized `v0.3.1` and mark it latest. Its source and packaged plist must restore
+   `StartInterval` to 86400, and its updater script must restore 0-900 seconds of jitter.
 
 3. Do not run `kickstart` or install the successor manually. Note its publication time, then watch
    the updater log:
@@ -258,9 +257,21 @@ without a manual kickstart, then leave the station running the production cadenc
    sudo cat /Library/Application\ Support/browser-print-agentd/updater/last-run.txt
    ```
 
-5. The final package replaces the plist on disk but does not boot out its currently loaded parent
-   updater. After the log records the completed final update and the updater exits, either reboot
-   the Mac or reload the system LaunchDaemon so launchd adopts the restored 86400-second interval:
+5. The automatic install replaces the plist on disk but does not boot out the loaded `v0.3.0`
+   updater that invoked it. After the log records the completed `v0.3.1` update and the updater
+   exits, prove the on-disk/loaded distinction:
+
+   ```bash
+   plutil -p \
+     /Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist | \
+     grep StartInterval
+   sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | \
+     grep 'run interval'
+   ```
+
+   Expect the plist to report `86400` while the still-loaded `v0.3.0` LaunchDaemon reports
+   `run interval = 60 seconds`. Then either reboot the Mac or reload the system LaunchDaemon so
+   launchd adopts the restored production interval:
 
    ```bash
    sudo launchctl bootout \
