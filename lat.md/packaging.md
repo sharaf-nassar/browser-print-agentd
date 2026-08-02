@@ -112,6 +112,39 @@ through `logger`. The plist is also the per-station configuration surface — po
 and the optional origin allowlist are edited there and nowhere else, and no origin ships in the
 package.
 
+### Request Log Ownership And Rotation
+
+The agent must own its log descriptor and size rotation; neither `newsyslog` nor launchd output
+redirection can enforce [[tools#Print Agent#Origin Posture#Request And Job Log Retention]].
+
+The packaged launcher currently opens `agent.log` with shell append redirection and then `exec`s
+the agent. A macOS 26.6 station inspection confirmed both stdout and stderr remain open on that
+same per-user inode for the process lifetime. Renaming the path does not move those descriptors to
+a new file: writes continue into the renamed archive until the agent reopens or restarts.
+
+`newsyslog` is rejected for this topology. Its installed manual and dry-run parser establish that
+configuration fields are whitespace-separated, with no quoting or escaping for a home path that
+contains a space. A glob avoids naming one account but cannot supply each matched file's dynamic
+owner and group. More importantly, the agent has no pid file or reopen signal: the `N` flag leaves
+its descriptors on the archive, while a signal introduces a compression or rename race and a
+service restart in the middle of a request. Its periodic system job also bounds only the size seen
+when that job runs, not growth between runs.
+
+launchd's `StandardOutPath` and `StandardErrorPath` only map descriptors to a static absolute
+path; they have no rotation or retention keys and do not expand a per-user home. Sending records
+to unified logging instead is also rejected because the system's global retention policy gives
+this product no explicit size or age bound and changes the admin's plain-file audit workflow. A
+second root timer that stops the agent, rotates, and restarts it merely recreates a less safe
+daemon-owned rotator with additional root/user ownership and in-flight-job failure modes.
+
+The implementation follow-up must move all post-launch output to one writer opened by the daemon
+in the resolved account home. Under the logger mutex it checks size before each complete line,
+closes the active descriptor, shifts the seven archives by atomic rename, opens a new private
+active file, and appends the pending line. Startup enforces the same ring before the first write,
+so crashes and KeepAlive restarts cannot bypass the bound. Pre-launch failures remain in unified
+logging because no daemon exists yet to own the file. This implementation is follow-up issue
+`zebra-mac-agent-mau`; the current launcher remains unbounded until it lands.
+
 ### The launchd On-Demand Gate
 
 `KeepAlive` is the unconditional boolean, and a 2026-07-30 station run established that this is
@@ -219,9 +252,11 @@ so "uninstalled" is a checkable state rather than an assumption.
 It boots out and disables the job, deletes the plist, binary, and launcher, drops the keychain
 trust and deletes the cert **by SHA-1 fingerprint** (never by name, which would match any other
 `localhost` cert on the station), removes the cert and log directories, forgets the receipt, and
-confirms 9100/9101 came free. One ordering trap is documented rather than designed around: the
-uninstaller deletes the log, so copy it first if the agent is being removed because something was
-wrong.
+confirms 9100/9101 came free. Log deletion remains deliberate after adopting the bounded ring: a
+full uninstall should not leave origin and device audit data behind in an otherwise abandoned
+account directory. One ordering trap is documented rather than designed around: the uninstaller
+deletes the active log and every archive, so copy the directory first if the agent is being
+removed because something was wrong.
 
 Everything the script does is per-account below the machine-wide payload, so a station with more
 than one printing account needs one `--user <account>` run per account. When an admin runs it at

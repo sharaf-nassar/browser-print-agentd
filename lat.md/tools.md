@@ -208,8 +208,8 @@ auditable rather than silent.
 
 `[[log.go#agentLogger#request]]` records the `Origin` of every request, and
 `[[log.go#agentLogger#job]]` records each job's outcome with the device uid, byte count, `lp`
-request id, and origin — the minimal audit trail v1 commits to (a formal retention policy is a
-non-goal). `--origin-allow` takes an optional comma-separated allowlist
+request id, and origin — the minimal audit trail v1 commits to. `--origin-allow` takes an optional
+comma-separated allowlist
 (`[[server.go#parseOriginAllow]]`); when it is configured,
 `[[server.go#agent#originAllowed]]` rejects a print request from any other origin — including one
 with no `Origin` header — before any `lp` call runs, and logs the rejection. Unconfigured, the
@@ -220,6 +220,30 @@ Both write-capable routes go through the one gate. `[[server.go#agent#enforceOri
 `/write` and `/print-pdf` share, deliberately rather than incidentally: a second route that
 spools to a printer but skipped the allowlist would make the allowlist bypassable by posting a
 PDF instead of ZPL, so the check is structural and is asserted on both routes.
+
+### Request And Job Log Retention
+
+The adopted retention window is a size-bound ring: one active 8 MiB log and seven 8 MiB archives,
+for at most 64 MiB of complete audit records per account.
+
+The daemon rotates immediately before appending a complete line that would take `agent.log` over
+8 MiB. `agent.log.1` is the newest archive and `agent.log.7` the oldest; the oldest is deleted
+when the next generation is created. Archives remain uncompressed so an admin can use ordinary
+`grep` and `tail`, and so the stored-byte bound does not depend on compression ratios or temporary
+compression files. This is deliberately a size, not age, window: busy stations evict history
+sooner, while quiet stations keep it until size pressure or uninstall.
+
+Rotation never splits or rewrites a record. Every retained request line therefore keeps its full
+origin, and every retained job line keeps its origin, device uid, byte count, and `lp` request id.
+Payload bytes, credentials, printer serials, and site-specific metadata are not added. The log
+directory is private mode 0700 and the active file and archives are mode 0600, because origins and
+device identifiers are useful audit data but should not be readable by unrelated local accounts.
+
+The mechanism is daemon-owned rotation, specified in
+[[packaging#Packaging#Station Installer#Request Log Ownership And Rotation]]. Beads issue
+`zebra-mac-agent-w1o` records the decision; `zebra-mac-agent-mau` implements it. Until that
+follow-up ships, the launcher still appends to one unbounded `agent.log`, so this policy is not
+claimed as an enforced property of the current package.
 
 ## Version And Health Surface
 

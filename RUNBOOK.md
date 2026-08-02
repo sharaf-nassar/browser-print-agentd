@@ -766,6 +766,22 @@ curl -fsSk https://127.0.0.1:9101/available
 - Never ask an operator to trust a certificate. It is an admin action, and `postinstall` does it
   machine-wide under root precisely so nobody at the keyboard has to.
 
+### Agent log retention
+
+The adopted policy is one 8 MiB `agent.log` plus seven 8 MiB uncompressed archives, a 64 MiB
+per-account ceiling. Rotation keeps complete lines, so origin, device uid, byte count, and `lp`
+request id remain present until their archive is evicted. The log directory and files become
+private to the station account under that policy.
+
+That daemon-owned rotation is not in the current package yet: the current launcher still appends
+to one unbounded `agent.log`. Until the implementation ships, monitor that file's size and copy it
+off the station before local disk pressure becomes a concern. Do not add a `newsyslog` rule as a
+local workaround; the running process keeps stdout and stderr open on the renamed inode and can
+continue growing the archive instead of the replacement file.
+
+The uninstaller will continue to delete the whole log directory, including every archive. During
+an incident, copy the directory rather than only the active file before uninstalling.
+
 ### The job left but no label
 
 The agent's honesty guarantee ends at "CUPS accepted the job". Past that:
