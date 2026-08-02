@@ -176,6 +176,8 @@ jobs:
           # something else fails the release instead of shipping quietly.
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "PKG_PATH=$RUNNER_TEMP/release/$BINARY_NAME-$VERSION.pkg" >> "$GITHUB_ENV"
+          echo "CHECKSUM_PATH=$RUNNER_TEMP/release/$BINARY_NAME-$VERSION.pkg.sha256" >> "$GITHUB_ENV"
+          echo "MANIFEST_PATH=$RUNNER_TEMP/release/update-manifest.txt" >> "$GITHUB_ENV"
           echo "releasing $BINARY_NAME $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-go@v6
@@ -426,7 +428,62 @@ jobs:
           fi
           echo "asset name: $ASSET"
 
-      - name: Attach the notarized .pkg to the tagged release
+      # The updater feed is derived only after notarization, stapling, and the
+      # quarantined Gatekeeper assessment have all passed. The expected files
+      # below are independently constructed and compared byte-for-byte so a
+      # whitespace or field-name drift cannot silently change the feed format.
+      - name: Create and verify release metadata assets
+        run: |
+          set -euo pipefail
+          PKG_ASSET=$(basename "$PKG_PATH")
+          CHECKSUM_ASSET=$(basename "$CHECKSUM_PATH")
+          MANIFEST_ASSET=$(basename "$MANIFEST_PATH")
+          EXPECTED_PKG_ASSET="$BINARY_NAME-$VERSION.pkg"
+          if [ "$PKG_ASSET" != "$EXPECTED_PKG_ASSET" ]; then
+            echo "::error::package asset is $PKG_ASSET, not $EXPECTED_PKG_ASSET"
+            exit 1
+          fi
+          if [ "$CHECKSUM_ASSET" != "$EXPECTED_PKG_ASSET.sha256" ]; then
+            echo "::error::checksum asset is $CHECKSUM_ASSET, not $EXPECTED_PKG_ASSET.sha256"
+            exit 1
+          fi
+          if [ "$MANIFEST_ASSET" != "update-manifest.txt" ]; then
+            echo "::error::manifest asset is $MANIFEST_ASSET, not update-manifest.txt"
+            exit 1
+          fi
+
+          PKG_SHA256=$(shasum -a 256 "$PKG_PATH" | awk '{print $1}')
+          if ! printf '%s\n' "$PKG_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::package SHA-256 is not 64 lowercase hexadecimal characters"
+            exit 1
+          fi
+
+          printf '%s  %s\n' "$PKG_SHA256" "$PKG_ASSET" > "$CHECKSUM_PATH"
+          printf 'version=%s\nasset=%s\nsha256=%s\n' \
+            "$VERSION" "$PKG_ASSET" "$PKG_SHA256" > "$MANIFEST_PATH"
+
+          EXPECTED_CHECKSUM="$RUNNER_TEMP/expected-release.sha256"
+          EXPECTED_MANIFEST="$RUNNER_TEMP/expected-update-manifest.txt"
+          printf '%s  %s\n' "$PKG_SHA256" "$EXPECTED_PKG_ASSET" \
+            > "$EXPECTED_CHECKSUM"
+          printf 'version=%s\nasset=%s\nsha256=%s\n' \
+            "$VERSION" "$EXPECTED_PKG_ASSET" "$PKG_SHA256" \
+            > "$EXPECTED_MANIFEST"
+          if ! cmp -s "$EXPECTED_CHECKSUM" "$CHECKSUM_PATH"; then
+            echo "::error::$CHECKSUM_ASSET content does not match the package digest and asset name byte-for-byte"
+            exit 1
+          fi
+          if ! (cd "$(dirname "$PKG_PATH")" && shasum -a 256 -c "$CHECKSUM_ASSET"); then
+            echo "::error::$CHECKSUM_ASSET does not verify $PKG_ASSET"
+            exit 1
+          fi
+          if ! cmp -s "$EXPECTED_MANIFEST" "$MANIFEST_PATH"; then
+            echo "::error::$MANIFEST_ASSET content does not match its release inputs byte-for-byte"
+            exit 1
+          fi
+          echo "metadata assets: $CHECKSUM_ASSET, $MANIFEST_ASSET"
+
+      - name: Attach the notarized package and metadata to the tagged release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -436,6 +493,7 @@ jobs:
           set -euo pipefail
           if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release create "$TAG_NAME" --verify-tag \
+              --latest=false \
               --title "$TAG_NAME" \
               --notes "Notarized macOS installer for browser-print-agentd. Install the .pkg on the station Mac; the agent reports $VERSION on GET /health and the X-Print-Agent-Version header. To roll a station back to an earlier build, install that release's .pkg over this one — see README.md."
           fi
@@ -444,10 +502,14 @@ jobs:
           # differently-named asset, so no prior installer is ever overwritten.
           # Nothing in this workflow deletes: there is no `gh release delete` and
           # no `gh release delete-asset` anywhere in it, by design.
-          gh release upload "$TAG_NAME" "$PKG_PATH" --clobber
+          gh release upload "$TAG_NAME" \
+            "$PKG_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH" --clobber
+          # Publish the stable feed only after every asset is attached. This is
+          # explicit rather than GitHub's date/version-based latest selection.
+          gh release edit "$TAG_NAME" --latest
           gh release view "$TAG_NAME" --json assets \
             --jq '.assets[] | "\(.name)\t\(.size) bytes"'
-          echo "✅ published $(basename "$PKG_PATH") on $TAG_NAME" \
+          echo "✅ published $(basename "$PKG_PATH"), $(basename "$CHECKSUM_PATH"), and $(basename "$MANIFEST_PATH") on $TAG_NAME" \
             >> "$GITHUB_STEP_SUMMARY"
 
       # Retention is only real if it is checked, so the run that ships a build

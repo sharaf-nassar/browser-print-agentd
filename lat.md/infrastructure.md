@@ -76,7 +76,7 @@ readable from a calling workflow.
 ## Release Chain
 
 What any path that ships a `.pkg` is held to: gate, sign, notarize, staple, verify the packaged
-binary, then publish an asset that is never overwritten.
+binary, then publish the installer and its metadata assets without overwriting another release.
 
 `.github/workflows/release.yml` is that path, and the repository side of the contract it drives is
 `packaging/build-pkg.sh`, `packaging/identity.sh`, and the `-X main.version` linker seam. The
@@ -192,9 +192,9 @@ gating nothing automatically.
 
 ### Asset Retention
 
-The asset is named `browser-print-agentd-<version>.pkg`, so every release keeps its own installer
-and no prior notarized `.pkg` is ever overwritten. That is the retention half of the documented
-downgrade path.
+The installer asset is named `browser-print-agentd-<version>.pkg`, so every release keeps its own
+installer and no prior notarized `.pkg` is ever overwritten. That is the retention half of the
+documented downgrade path.
 
 The exact name is asserted before upload rather than trusted to convention, because an
 unversioned asset would make a downloaded installer ambiguous about which build it carries. One
@@ -202,12 +202,29 @@ version string drives the linker stamp, the package version `build-pkg.sh` hands
 that asset name, so the release path can predict the package path and hard-fail when the script
 writes something else instead of discovering whatever it happened to produce.
 
+Only after the package passes notarization, stapling, and the quarantined Gatekeeper assessment
+does the workflow derive two metadata assets from it. `<pkg>.sha256` is one `shasum`-compatible
+line containing the lowercase package digest and exact installer asset name. The stable
+`update-manifest.txt` asset is exactly three newline-terminated records:
+
+```text
+version=<X.Y.Z>
+asset=<browser-print-agentd-X.Y.Z.pkg>
+sha256=<64 lowercase hexadecimal characters>
+```
+
+The workflow constructs expected checksum and manifest files independently and compares them
+byte-for-byte before upload. It also asserts all three asset names rather than trusting path
+construction. The package, checksum, and manifest are uploaded together, and the release is
+marked `--latest` explicitly so the future updater's `releases/latest/download/…` URL resolves to
+the feed that names that package.
+
 Retention is only real if a run proves it, so the run that ships a build also names the build a
 station falls back to: after upload the previous `v*` release is read back and its installer and
 download URL recorded as this release's rollback target — the input
 [[operations#Station Operations#Rollback Path]] consumes, and the reason retention is a gate rather
 than a habit. Nothing in the path deletes, and a
-`--clobber` on the upload can only ever replace the asset of the tag being released, since a
-different tag is a different release. A prior release with no `.pkg` warns rather than fails —
+`--clobber` on the upload can only ever replace the three assets of the tag being released, since
+a different tag is a different release. A prior release with no `.pkg` warns rather than fails —
 the package just shipped is already published and notarized, and failing there would report a bad
 release for a defect in an older one.

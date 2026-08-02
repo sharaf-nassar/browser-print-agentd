@@ -100,9 +100,9 @@ routes — and updating becomes the job of a separate root daemon. The frozen wi
 `Device` shape, and the no-downgrade-guard install-over-install path of
 [[operations#Station Operations#Rollback Path]] are all untouched, and pinning a station stays one
 command: `sudo launchctl disable system/<updater-label>`. Implementation is phased and tracked in
-beads — phase 1 the release-side manifest and checksum assets, phase 2 the updater daemon plus
-the runbook updates, phase 3 the `/health` update visibility — and `RUNBOOK.md` changes only when
-the updater ships, because it describes shipping behavior alone.
+beads — phase 1, the release-side manifest and checksum assets, is shipped; phase 2 is the updater
+daemon plus the runbook updates; phase 3 is the `/health` update visibility. `RUNBOOK.md` changes
+only when the updater ships, because it describes shipping behavior alone.
 
 ### The Adopted Updater Shape
 
@@ -121,12 +121,13 @@ process that spawned `installer` — cannot occur, and
 a `gui`-domain condition on a job the system domain never sees.
 
 Each run skips unless a console user is present, because `postinstall` requires one. Otherwise it
-fetches a small `update-manifest.txt` (version, asset name, sha256) from the stable
-`releases/latest/download/…` URL and compares against the installed receipt via
-`pkgutil --pkg-info`. The manifest is the truth: it installs whenever the manifest version
-*differs* from the installed one, not only when it is newer — so yanking a bad release (marking
-it prerelease on GitHub) automatically rolls the fleet back to the previous good build, turning
-[[infrastructure#Infrastructure#Release Chain#Asset Retention]] into a fleet-healing mechanism.
+fetches `update-manifest.txt` from the stable `releases/latest/download/…` URL and compares its
+`version`, `asset`, and `sha256` records against the installed receipt via `pkgutil --pkg-info`.
+The byte-exact format is owned by
+[[infrastructure#Infrastructure#Release Chain#Asset Retention]]. The manifest is the truth: it
+installs whenever the manifest version *differs* from the installed one, not only when it is newer
+— so yanking a bad release (marking it prerelease on GitHub) automatically rolls the fleet back
+to the previous good build, turning asset retention into a fleet-healing mechanism.
 
 Verification is explicit, because a CLI `installer` bypasses Gatekeeper entirely. The sha256 from
 the manifest is the primary gate. `pkgutil --check-signature` checks the Developer ID Team ID,

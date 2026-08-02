@@ -177,8 +177,9 @@ Releases are cut by tagging `v*.*.*` (`v0.1.0`, `v0.2.0`, …). Pushing the tag 
    verifies with `spctl` that Gatekeeper reports `Notarized Developer ID`;
 4. self-verifies that the packaged binary reports the tagged version on both `GET /health` and
    `X-Print-Agent-Version`, and that the asset name carries that version;
-5. attaches `browser-print-agentd-<version>.pkg` to the GitHub release and records the previous
-   release as the documented rollback target.
+5. attaches `browser-print-agentd-<version>.pkg`, its `.sha256`, and
+   `update-manifest.txt` to the GitHub release, marks that release latest explicitly, and records
+   the previous release as the documented rollback target.
 
 Nothing in that workflow deletes a tag, a release, or an asset — every shipped `.pkg` stays
 independently downloadable, because rollback is exactly one step: install the previous release's
@@ -202,4 +203,3 @@ is the cheapest way to find out that a pasted credential is wrong.
 ## License
 
 [MIT](./LICENSE).
-
