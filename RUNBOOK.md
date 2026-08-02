@@ -806,10 +806,11 @@ lpoptions -p <queue> | tr ' ' '\n' | grep printer-make-and-model
 ```
 
 CUPS's own label driver reports `Zebra ZPL Label Printer`. That driver's filter writes a literal
-`^POI` — "invert 180" — into every job it renders, with no option or device default that can switch
-it off, so the agent counter-rotates those jobs with `-o orientation-requested=6`. A queue with any
-other driver is left alone on purpose: rotating one that does not flip would turn a correct page
-upside down.
+`^POI` and a device-stored graphic into every job, with no option that switches either off. The
+agent therefore runs that queue's PPD offline, validates and decodes the filter output, rotates the
+pixels itself, and raw-spools fresh `^PON` plus inline `^GFA`. A queue with any other driver keeps
+the ordinary document path on purpose: rewriting output for a driver that does not need it would
+turn a correct page into printer-specific garbage.
 
 Three things make a sheet come out inverted anyway:
 
@@ -820,6 +821,10 @@ Three things make a sheet come out inverted anyway:
   "does not flip", which leaves the job unrotated. This direction is deliberate — the alternative
   is inverting every queue on the station on a guess — but it means a broken probe looks exactly
   like the original bug. Confirm `which lpoptions` resolves.
+- **The queue PPD is unavailable or no longer matches the stock filter.** Rendering fails before
+  any `lp` submission unless `/etc/cups/ppd/<queue>.ppd` is readable and still declares the stock
+  ZPL model and `rastertolabel`. The agent log names this as a render or PPD validation error;
+  confirm `/usr/sbin/cupsfilter` and the PPD path exist rather than changing queue defaults.
 - **The verdict is cached for five minutes.** After changing a queue's driver, either wait it out
   or restart the agent with `launchctl kickstart -k gui/$(id -u)/io.github.sharaf-nassar.browser-print-agentd`.
 
@@ -1046,9 +1051,9 @@ its "not yet hardware-validated" note.
 ### 12. A rendered PDF sheet prints the same way up as a pinned ZPL label
 
 This is the one item that proves the driver-orientation compensation, and it cannot be proven by
-CI: automated coverage stops at the `lp` argv, while whether the page lands upright is a property
-of the filter chain and the physical printer. Use content with an unambiguous top — a solid bar
-across the top quarter is enough.
+CI: automated coverage stops after strict bitmap conversion and the recorded raw `lp` payload,
+while whether the page lands upright is a property of the physical printer. Use content with an
+unambiguous top — a solid bar across the top quarter is enough.
 
 - [ ] `lpoptions -p <queue> | tr ' ' '\n' | grep printer-make-and-model` reports the driver, and
       the station's Zebra queue reports `Zebra ZPL Label Printer`.

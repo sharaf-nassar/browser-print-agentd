@@ -44,12 +44,12 @@ them answers those paths with the plain-text `404` its default arm has always pr
 It takes the same `{device, data}` envelope as `/write` and reuses the same printer resolution,
 USB-to-network failover, and origin gating, so a sheet and a label can never disagree about which
 printer is usable. `data` that will not base64-decode, or that decodes to bytes not beginning with
-`%PDF`, is a `400` before any CUPS call; a body over 50 MB is a `413`. Unlike `/write` it spools
-**without `-o raw`**, because CUPS must render the PDF through its filter chain — raw PDF bytes
-would reach the device unrendered and print as garbage. A caller sends the PDF the way up it wants
-it printed: when — and only when — the resolved queue's driver rotates every rendered page 180°,
-the agent adds the counter-rotation that cancels it, so the sheet lands in the orientation it was
-authored in.
+`%PDF`, is a `400` before any CUPS call; a body over 50 MB is a `413`. A PDF always runs through a
+CUPS rendering chain — raw PDF bytes would reach the device unrendered and print as garbage. Most
+queues receive the PDF as an ordinary document. For the one stock Zebra ZPL driver that emits an
+inverted, device-stored graphic, the agent runs that queue's validated PPD offline, converts the
+bounded bitmap to upright inline `^GFA`, and raw-spools only the generated printer-native ZPL. The
+caller still sends the PDF the way up it wants it printed, and all other drivers remain untouched.
 
 **Ports.** `9100` is plain HTTP; loopback is exempt from mixed-content blocking, so
 Chromium-family browsers reach it directly from an HTTPS page. `9101` is TLS and exists only

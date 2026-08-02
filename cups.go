@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,6 +82,12 @@ const (
 	// temp directory, not for the filter chain.
 	zplSuffix = ".zpl"
 	pdfSuffix = ".pdf"
+
+	// restoreSavedConfiguration recalls the printer's last ^JUS-saved settings.
+	// The inverting CUPS label driver sends ^POI, and ^PO is retained by the
+	// printer for later formats. Recalling the saved configuration restores the
+	// operator's chosen orientation without assuming that it is ^PON.
+	restoreSavedConfiguration = "^XA^JUR^XZ"
 )
 
 // execResult is the outcome of one external command: CUPS reports state in the
@@ -90,6 +97,31 @@ type execResult struct {
 	ExitCode int
 	Stdout   string
 	Stderr   string
+}
+
+type boundedCapture struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (b *boundedCapture) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := b.limit - b.buffer.Len()
+	if remaining > len(data) {
+		remaining = len(data)
+	}
+	if remaining > 0 {
+		_, _ = b.buffer.Write(data[:remaining])
+	}
+	if remaining < len(data) {
+		b.exceeded = true
+	}
+	return written, nil
+}
+
+func (b *boundedCapture) String() string {
+	return b.buffer.String()
 }
 
 // execRunner is the seam that keeps the agent testable without CUPS. The real
@@ -108,13 +140,20 @@ type osRunner struct{}
 // mistake for "the queue said no".
 func (osRunner) Run(ctx context.Context, name string, args ...string) (execResult, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	var stdout, stderr bytes.Buffer
+	stdout := boundedCapture{limit: maxFilterOutputBytes}
+	stderr := boundedCapture{limit: maxFilterErrorBytes}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	result := execResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return result, fmt.Errorf("%s timed out: %w", name, ctxErr)
+	}
+	if stdout.exceeded {
+		return result, fmt.Errorf("%s stdout exceeded %d bytes", name, maxFilterOutputBytes)
+	}
+	if stderr.exceeded {
+		return result, fmt.Errorf("%s stderr exceeded %d bytes", name, maxFilterErrorBytes)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -132,14 +171,26 @@ func (osRunner) Run(ctx context.Context, name string, args ...string) (execResul
 // here, so the backend can be swapped when driver-backed queues disappear.
 type cupsClient struct {
 	runner       execRunner
+	renderer     documentRenderer
 	timeout      time.Duration
 	printTimeout time.Duration
+
+	// printOrder lets ordinary jobs spool concurrently, but gives an inverting
+	// document and its restoration job exclusive access to the submission
+	// stream. CUPS preserves job order within a destination, so no other job
+	// issued by this agent can land between the state-changing PDF and ^JUR.
+	printOrder sync.RWMutex
 }
 
 // newCUPSClient builds a client over runner with the default bounded timeouts.
 func newCUPSClient(runner execRunner) *cupsClient {
+	renderer := documentRenderer(cupsFilterRenderer{runner: runner})
+	if injected, ok := runner.(documentRenderer); ok {
+		renderer = injected
+	}
 	return &cupsClient{
 		runner:       runner,
+		renderer:     renderer,
 		timeout:      cupsCommandTimeout,
 		printTimeout: cupsPrintTimeout,
 	}
@@ -206,10 +257,10 @@ func (c *cupsClient) queueAccepting(ctx context.Context, queue string) (bool, er
 // or publishes none.
 //
 // `lpoptions -p <queue>` is the probe rather than the PPD file itself because
-// the PPD is not readable by the account the agent runs under: CUPS writes
-// /etc/cups/ppd/<queue>.ppd as 0640 root:lp, so a file-based probe would fail
-// closed on every station and the compensation would silently never apply.
-// `lpoptions` asks cupsd over IPP and answers for any local user.
+// it is cheap, works over IPP, and does not assume the PPD is readable. Only
+// after this probe identifies the exact stock ZPL driver does document
+// rendering open and validate that queue's PPD; an unreadable PPD then fails
+// that print before any printer submission instead of changing detection.
 func (c *cupsClient) driverModel(ctx context.Context, queue string) (string, error) {
 	result, err := c.run(ctx, "lpoptions", "-p", queue)
 	if err != nil {
@@ -238,33 +289,61 @@ func (c *cupsClient) deviceURIs(ctx context.Context) ([]queueDevice, error) {
 // error — it silently prints the wrong thing — so every ZPL invocation in this
 // agent carries it.
 func (c *cupsClient) printRaw(ctx context.Context, queue string, data []byte) (string, error) {
+	c.printOrder.RLock()
+	defer c.printOrder.RUnlock()
 	return c.spool(ctx, queue, data, zplSuffix, "-o", "raw")
 }
 
 // printDocument spools data as a DOCUMENT and returns the CUPS request id.
-// inverting says the destination's driver rotates every page 180 degrees, in
-// which case the job carries the counter-rotation that cancels it.
+// inverting says the destination uses Apple's ZPL label driver. That driver's
+// stored-graphic output is rendered offline, rewritten as inline graphics, and
+// raw-spooled; every other destination retains the ordinary document path.
 //
-// The absence of `-o raw` here is the whole point and is exactly as
-// load-bearing as its presence in printRaw. A PDF is not printer-native: CUPS
-// has to run it through its filter chain to turn it into something the device
-// understands, and `-o raw` would hand the raw PDF bytes straight to the
-// printer, which prints them as garbage rather than erroring. Never "unify"
-// these two by giving them the same lp options. The counter-rotation below is
-// only meaningful BECAUSE the filter chain runs: it is applied by the
-// PDF-to-raster stage, upstream of the label filter that does the flipping.
+// A PDF is never handed raw to a printer. Non-inverting queues submit the PDF
+// as a document so CUPS runs their normal filter chain. The one known
+// inverting driver is filtered OFFLINE, its captured bitmap is rewritten to
+// safe upright printer-native ZPL, and only that generated ZPL is raw-spooled.
 //
-// The counter-rotation is CONDITIONAL and must stay that way. Applying it
-// unconditionally would be a strictly worse bug than the one it fixes: on any
-// queue whose driver does not flip, it would invert a page that was arriving
-// upright, and it would do so silently.
+// The conversion is CONDITIONAL and must stay that way. Applying Zebra ZPL to
+// another driver's output would replace a correct document with the wrong
+// printer language, and it would do so silently.
 func (c *cupsClient) printDocument(
 	ctx context.Context, queue string, data []byte, inverting bool,
 ) (string, error) {
-	if inverting {
-		return c.spool(ctx, queue, data, pdfSuffix, "-o", reversePortrait)
+	if !inverting {
+		c.printOrder.RLock()
+		defer c.printOrder.RUnlock()
+		return c.spool(ctx, queue, data, pdfSuffix)
 	}
-	return c.spool(ctx, queue, data, pdfSuffix)
+
+	c.printOrder.Lock()
+	defer c.printOrder.Unlock()
+
+	renderContext, cancel := context.WithTimeout(ctx, renderTimeout(c.printTimeout))
+	filtered, err := c.renderer.Render(renderContext, queue, data)
+	cancel()
+	if err != nil {
+		return "", fmt.Errorf("render inverting PDF: %w", err)
+	}
+	upright, err := transformRasterLabelZPL(filtered)
+	if err != nil {
+		return "", fmt.Errorf("transform inverting PDF: %w", err)
+	}
+
+	requestID, err := c.spool(ctx, queue, upright, zplSuffix, "-o", "raw")
+	if err != nil {
+		return "", err
+	}
+
+	// Once CUPS has accepted the rendered job, restoring shared printer state is required
+	// even if the HTTP client disconnects and cancels ctx. WithoutCancel keeps
+	// request values while runFor still gives the lp submission its own bound.
+	restoreContext := context.WithoutCancel(ctx)
+	if _, err := c.spool(restoreContext, queue, []byte(restoreSavedConfiguration),
+		zplSuffix, "-o", "raw"); err != nil {
+		return "", fmt.Errorf("restore saved printer configuration: %w", err)
+	}
+	return requestID, nil
 }
 
 // spool writes data to a temp file with suffix and hands it to `lp -d <queue>`

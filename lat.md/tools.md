@@ -130,15 +130,12 @@ surfaces as a send error. The divergence is invisible to the transport, which st
 envelope as `/write` with `data` carrying a base64-encoded PDF. It exists for the multi-cell label
 SHEET a caller renders when one ZPL label per print will not do.
 
-**`/print-pdf` must never be given `-o raw`, and this is the one invariant a future editor is
-likely to break.** The two print routes look symmetrical and the temptation to collapse them into
-one lp invocation is real, but the option is correct on exactly one of them. ZPL is
-printer-native, so `-o raw` is what stops the filter chain from rasterizing it. A PDF is the
-opposite: it is not printer-native, CUPS has to render it, and `-o raw` would push the raw PDF
-bytes to the device, which prints them as garbage. Neither mistake produces an error — both
-silently print the wrong thing, the exact failure class this agent was built to eliminate — so
-[[tests#Agent Core#Print PDF Spools A Document Without Raw]] asserts the presence and the absence
-in the same test rather than trusting a comment.
+**A PDF must be rendered before anything raw reaches the printer.** Most queues receive the PDF
+as a normal document with no `-o raw`; [[tests#Agent Core#Print PDF Spools A Document Without Raw]]
+pins that default. The stock inverting ZPL driver is the narrow exception: its PPD runs offline,
+then only the newly authored printer-native inline ZPL is submitted raw. `/write` remains raw
+because its caller already supplied printer-native ZPL. Handing the original PDF raw to either
+branch would print document bytes as garbage.
 
 Everything else is deliberately shared rather than duplicated.
 `[[server.go#agent#resolveTarget]]` picks the printer and performs the same USB-to-network
@@ -160,30 +157,50 @@ A PDF that renders correctly still comes out upside down on a queue driven by CU
 filter, and the agent — not the caller — is what corrects it. `[[cups.go#invertingDriver]]` decides
 whether the destination flips and `[[cups.go#cupsClient#printDocument]]` cancels it.
 
-`rastertolabel` writes a literal `^POI` — ZPL for "invert 180" — into every job its `ZEBRA_ZPL`
-arm produces, with the source comment "Rotate 180 degrees so that the top of the label/page is at
-the leading edge". It is a straight-line `puts` with no branch, no PPD option, and no device
-default behind it, so nothing handed to `lp` can switch it off. The PPD (`Zebra ZPL Label Printer`,
-`*cupsFilter: "application/vnd.cups-raster 50 rastertolabel"`) exposes no orientation option at
-all. Three prints settled it: ZPL pinning `^PON` printed upright, ZPL with no `^PO` printed
-inverted, and a PDF through `/print-pdf` printed inverted.
+`rastertolabel` hardcodes two unsuitable choices in its `ZEBRA_ZPL` arm: `^POI` rotates the page
+and persists as shared printer state, while `~DGR:CUPS.GRF` plus `^XG` stores and recalls the full
+page through printer RAM. The PPD (`Zebra ZPL Label Printer`, `*cupsModelNumber: 18`, and
+`*cupsFilter: "application/vnd.cups-raster 50 rastertolabel"`) exposes no option for orientation,
+graphic encoding, or storage mode.
 
-The only lever left is upstream of the filter, so `/print-pdf` passes `-o orientation-requested=6`
-— IPP reverse-portrait — which makes the PDF-to-raster stage hand `rastertolabel` an
-already-inverted raster that its own `^POI` rights again. This was measured, not assumed: running
-the real chain (`ppdc -d ppd /usr/share/cups/drv/sample.drv`, then `cupsfilter -p ppd/zebra.ppd -m
-printer/foo -e`) and decoding the emitted `~DGR:CUPS.GRF` payload back to a bitmap shows the black
-bar's pixel mass moving from the top quarter to the bottom quarter (234904/9744 → 9744/234904)
-while `^POI` stays in the output unchanged. `=3` is byte-identical to passing nothing; `=4`, `=5`
-and `-o landscape` rotate 90° and crop.
+Hardware separated those failures. The filter's exact compressed stored graphic printed blank;
+expanding only its RLE to full uppercase hex was still blank. The same pixels cropped to a bounded
+uncompressed inline `^GFA` printed visible and upright. The driver remains the raster source, but
+its device-stored command stream must never be forwarded.
+
+For this driver only, [[zpl_document.go#cupsFilterRenderer#Render]] copies the runtime queue PPD
+after validating those three identity directives, then runs absolute `/usr/sbin/cupsfilter` with
+`-p <copy> -m printer/foo -e -o orientation-requested=6`. This is filter-only execution: it never
+addresses a destination or creates a CUPS job. Reverse portrait turns the raster upstream, exactly
+where the old `^POI` expected it.
+
+[[zpl_document.go#transformRasterLabelZPL]] accepts only the captured straight-line
+`rastertolabel` grammar. It bounds pages, dimensions, decoded bytes, command output, and every PPD
+setting it preserves; any unknown command fails before `lp`. It decodes the stored bitmap, rotates
+the pixels 180 degrees to replace `^POI`, and authors `^PON`, explicit `^PW`, `^LL`, `^LH`, and
+`^MN` plus uncompressed inline `^GFA`. A field carries at most 99,999 bytes, so a large page is
+split into whole-row bands with explicit `^FO0,y` origins. Neither `~DG`, `^XG`, `^ID`, nor `^POI`
+can reach the printer through this path.
+
+The generated `^PON` also changes shared printer state. After CUPS accepts the raw generated job,
+`printDocument` therefore submits `^JUR` to the same queue. `^JUR` recalls the complete last
+`^JUS`-saved configuration, preserving the operator's chosen orientation and media settings
+instead of assuming that normal must remain `^PON`.
+
+Submission ordering is part of the correction. `[[cups.go#cupsClient#printRaw]]` and ordinary
+document jobs take shared access to the agent's print-order gate, while the inverting PDF holds
+exclusive access through offline rendering, generated-ZPL submission, and restoration. CUPS then
+sees the generated page and restore as adjacent jobs on the destination; another concurrent agent
+request cannot be accepted between them and inherit `^PON`. Once the page is accepted, restoration
+uses its own bounded context even if the HTTP request is canceled, because abandoned shared state
+is more harmful than an abandoned response.
 
 **Two things about this must not be "simplified".**
 
-**It is conditional, and unconditional rotation would be a worse bug than the one it fixes.** The
-obvious edit — always pass the option, since the station is a label printer anyway — inverts a
-correct page on every queue whose driver does not flip, and does it silently, which is the failure
-class this agent exists to eliminate. `[[tests#Agent Core#Print PDF Leaves A Non Inverting Driver
-Alone]]` fails if the option ever reaches a non-flipping queue.
+**It is conditional, and unconditional conversion would be a worse bug than the one it fixes.**
+Running a non-ZPL driver's PDF through this Zebra-specific grammar either fails or authors the
+wrong printer language. `[[tests#Agent Core#Print PDF Leaves A Non Inverting Driver Alone]]` fails
+if offline rendering or raw ZPL reaches any non-inverting queue.
 
 **It is keyed on the DRIVER, not on "the queue uses `rastertolabel`".** That one filter binary
 drives six label languages off the PPD's `*cupsModelNumber`, and the `^POI` lives in exactly one of
@@ -191,14 +208,14 @@ them. A DYMO, CPCL, or EPL queue runs the same binary and does NOT flip, so filt
 would invert three families of printer that print correctly today. It is equally not keyed on
 "Zebra": a Zebra queue driven by a vendor PPD or by IPP Everywhere never reaches this filter.
 
-The probe is `lpoptions -p <queue>`, read for `printer-make-and-model` — the PPD's `*NickName`
-republished over IPP. The PPD file itself is not the source because CUPS writes
-`/etc/cups/ppd/<queue>.ppd` as `0640 root:lp` and the agent does not run as root, so a file-based
-probe would fail on every station and the compensation would silently never apply.
+The initial probe is `lpoptions -p <queue>`, read for `printer-make-and-model` — the PPD's
+`*NickName` republished over IPP. It is cheap and does not require opening every queue's PPD.
 `[[health.go#driverChecker]]` caches the verdict for five minutes, next to the health cache and for
 the opposite reason: health changes minute to minute, a driver changes only when an operator
 reinstalls the printer. Any probe failure reads as "does not flip" — the direction that leaves the
-known bug in place rather than inverting every queue on the station on a guess.
+known bug in place rather than rewriting every queue on the station on a guess. Once the exact
+driver is known, its PPD becomes render input and must be readable and pass identity validation;
+failure there is a plain render error before any printer submission.
 
 The verdict is taken for the queue `[[server.go#agent#resolveTarget]]` actually returned, not the
 one the caller asked for. Failover can move a job to a different printer with a different driver,

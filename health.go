@@ -113,15 +113,15 @@ func newDriverChecker(cups *cupsClient) *driverChecker {
 	}
 }
 
-// inverting reports whether the queue's driver rotates every rendered page 180
-// degrees, so a document bound for it needs the counter-rotation.
+// inverting reports whether the queue uses the stock driver whose inverted,
+// stored-graphic output needs the bounded inline-ZPL conversion.
 //
 // A probe error — no `lpoptions` binary, a hung device blowing the command
 // timeout, an unparseable answer — reads as NOT inverting. That direction is
-// deliberate and is the opposite of a "fail closed" instinct: the compensation
-// is a rotation, so guessing wrong in the true direction turns an upright page
-// upside down on every queue on the station, while guessing wrong in the false
-// direction leaves the known bug exactly as it already is. Only a positively
+// deliberate and is the opposite of a "fail closed" instinct: guessing wrong
+// in the true direction sends Zebra ZPL to another printer language, while
+// guessing wrong in the false direction leaves the known bug exactly as it
+// already is. Only a positively
 // identified inverting driver gets rotated.
 func (d *driverChecker) inverting(ctx context.Context, queue string) bool {
 	now := d.now()

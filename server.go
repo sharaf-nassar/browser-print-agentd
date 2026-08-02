@@ -252,9 +252,10 @@ func (a *agent) handleWrite(w http.ResponseWriter, r *http.Request, origin strin
 // empty-200/plain-text-error convention — so a sheet and a label can never
 // disagree about which printer is usable or whether a station is dead.
 //
-// The lp invocation is what must differ, in two ways: no `-o raw`, and a
-// counter-rotation when the destination's driver flips the page. See
-// printDocument for both.
+// Submission differs only after the resolved driver is known: ordinary queues
+// receive the PDF as a document, while the stock inverting ZPL driver is
+// filtered offline and receives only validated generated ZPL. See
+// printDocument for both branches.
 func (a *agent) handlePrintPDF(w http.ResponseWriter, r *http.Request, origin string) {
 	// Identical gate to /write, and load-bearing for the same reason. This route
 	// spools to a physical printer, so leaving it off the allowlist would make

@@ -98,32 +98,68 @@ ZPL and print the label as a picture of itself.
 
 ### Print PDF Spools A Document Without Raw
 
-Verifies `POST /print-pdf` decodes its base64 payload, spools it byte-identically, and invokes
-`lp` as exactly `-d <queue> <file>` with **no** `-o raw`, while the same run proves `/write` still
-carries `-o raw`.
+Verifies `POST /print-pdf` for an ordinary non-inverting queue decodes its base64 payload, spools
+it byte-identically, and invokes `lp` as exactly `-d <queue> <file>` with **no** `-o raw`, while the
+same run proves `/write` still carries `-o raw`.
 
 The two routes are asserted apart rather than each in isolation because the failure they guard
 against is symmetrical and silent. `-o raw` on a PDF hands unrendered bytes to the device;
 its absence on ZPL lets `zebra.ppd` rasterize the label. Neither errors — both print the wrong
 thing — so a future editor "unifying" the two lp invocations has to break a named assertion.
 
-### Print PDF Counter Rotates An Inverting Driver
+### Print PDF Converts An Inverting Driver To Inline Graphics
 
-Verifies a `/print-pdf` job bound for a queue reporting the `Zebra ZPL Label Printer` driver is
-spooled as exactly `-d <queue> -o orientation-requested=6 <file>`, while `/write` on that station
-keeps `-o raw` and no orientation.
+Verifies a PDF bound for the stock inverting ZPL driver is rendered offline and spooled as bounded
+upright inline ZPL, while `/write` remains unchanged.
 
-The value is asserted literally because it is not guessable. IPP `orientation-requested=6` is
-reverse-portrait — a 180° rotation applied by the PDF-to-raster stage, which is what makes the
-label filter's own unconditional `^POI` cancel out. `=3` is a no-op and `=4`/`=5` rotate 90° and
-crop. The same test re-asserts the absence of `-o raw`, since the counter-rotation only works
-BECAUSE the filter chain runs and a future editor adding raw would silently undo it.
+The fake renderer must receive the source PDF exactly once for the resolved queue. The first `lp`
+payload then contains `^PON`, explicit geometry, and uncompressed `^GFA` with pixels rotated into
+the authored orientation; `~DG`, `^XG`, `^ID`, and `^POI` are forbidden. Only that generated ZPL
+is submitted with `-o raw`, and the sibling `/write` path remains printer-native and untouched.
+
+### Raster Label Transformation Is Bounded And Fail Closed
+
+Verifies captured stored graphics become upright inline row bands within ZPL field and agent byte
+limits, while malformed or unknown filter output is rejected.
+
+One raster large enough to cross 99,999 bytes must become two whole-row `^GFA` fields with
+explicit origins and label dimensions. Unexpected commands, inconsistent declared sizes,
+out-of-width pixels, and binary output each fail rather than being forwarded. Multiple pages stay
+separate bounded formats under one raw submission.
+
+### Print PDF Rejects Unsafe Filter Output Before Spooling
+
+Verifies unexpected output from the offline stock-driver filter produces a plain print failure
+before any `lp` call can reach a printer.
+
+The renderer is still called exactly once, which distinguishes a parser refusal from a route or
+driver-detection failure. Neither the page nor a restoration job is submitted because printer
+state has not changed.
+
+### Queue PPD Validation Pins The Stock ZPL Filter
+
+Verifies offline conversion accepts only a safe queue name and a PPD declaring the exact stock ZPL
+model number, identity, and rastertolabel filter.
+
+Removing any required directive or introducing a path-bearing queue name fails before cupsfilter.
+This keeps a queue reconfiguration from feeding an unrelated printer language to the strict ZPL
+parser.
+
+### Print PDF Restores Saved Printer Orientation
+
+Verifies generated inline ZPL for an inverting driver is immediately followed by raw `^JUR` on the
+same queue, while a PDF for a non-inverting driver emits no restoration job.
+
+The restore recalls the last `^JUS`-saved configuration rather than hardcoding `^PON`, so the
+agent returns shared printer state to the operator's chosen baseline. Its raw submission is
+load-bearing: sending `^JUR` through the document filter would rasterize the command instead of
+executing it.
 
 ### Print PDF Leaves A Non Inverting Driver Alone
 
-Verifies no orientation option reaches `lp` when the driver does not flip: a Zebra CPCL queue (the
-SAME filter binary, a different label language), a queue with no driver, one publishing no model,
-and one whose probe fails.
+Verifies no offline renderer, raw ZPL, or orientation option affects a Zebra CPCL queue (the SAME
+filter binary, a different label language), a queue with no driver, one publishing no model, or
+one whose probe fails.
 
 This is the half that makes the fix safe rather than merely effective. An unconditional rotation
 would double-invert every one of these cases, turning a correct page upside down on printers that

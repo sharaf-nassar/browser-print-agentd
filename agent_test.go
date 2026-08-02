@@ -66,8 +66,8 @@ const (
 // Driver identities `lpoptions` can report, as CUPS's own label driver spells
 // them in its *NickName.
 const (
-	// zplModel is the driver whose rastertolabel arm emits an unconditional
-	// `^POI`, so a document bound for it needs the counter-rotation.
+	// zplModel is the driver whose rastertolabel arm emits persistent `^POI`
+	// plus an unusable stored graphic, so its output needs strict conversion.
 	zplModel = "Zebra ZPL Label Printer"
 
 	// cpclModel is the SAME rastertolabel binary driving a different label
@@ -95,6 +95,11 @@ type lpCall struct {
 	Payload []byte
 }
 
+type renderCall struct {
+	Queue    string
+	Document []byte
+}
+
 // fakeCUPS stands in for lp/lpstat. `devices` is what `lpstat -v` enumerates
 // and `states` is each queue's health; an unlisted queue reads as absent.
 type fakeCUPS struct {
@@ -105,10 +110,17 @@ type fakeCUPS struct {
 	lpExit  int
 	lpErr   string
 
+	// renderedZPL is captured stock rastertolabel output. Nil selects the small
+	// valid fixture below; a non-nil value lets strict-parser tests inject a
+	// malformed stream. renderErr simulates an offline-filter failure.
+	renderedZPL []byte
+	renderErr   error
+	renderCalls []renderCall
+
 	// models is the driver identity `lpoptions -p <queue>` publishes per queue.
 	// A queue with no entry reports rawModel — no driver, nothing that forces
 	// orientation — so a test that says nothing about drivers gets a station
-	// where no job is counter-rotated.
+	// where no document is rewritten as Zebra-specific inline graphics.
 	models map[string]string
 
 	// optionCalls counts lpoptions invocations so a test can prove the driver
@@ -118,6 +130,31 @@ type fakeCUPS struct {
 	// optionsFail makes every lpoptions invocation fail the way a missing binary
 	// does, to pin what an unanswerable driver probe is treated as.
 	optionsFail bool
+}
+
+const sampleRasterLabelZPL = "~DGR:CUPS.GRF,2,1,\n4008^XA\n" +
+	"^POI\n^PW8\n^LH0,0\n^MNY\n" +
+	"^FO0,0^XGR:CUPS.GRF,1,1^FS\n^XZ\n" +
+	"^XA\n^IDR:CUPS.GRF^FS\n^XZ\n"
+
+// Render is the documentRenderer seam. It records the PDF and returns filter
+// output without invoking cupsfilter, CUPS, or a printer.
+func (f *fakeCUPS) Render(
+	ctx context.Context, queue string, document []byte,
+) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renderCalls = append(f.renderCalls, renderCall{
+		Queue:    queue,
+		Document: append([]byte(nil), document...),
+	})
+	if f.renderErr != nil {
+		return nil, f.renderErr
+	}
+	if f.renderedZPL != nil {
+		return append([]byte(nil), f.renderedZPL...), nil
+	}
+	return []byte(sampleRasterLabelZPL), nil
 }
 
 // Run answers lpstat and lpoptions from the queue maps and records lp without
@@ -228,6 +265,12 @@ func (f *fakeCUPS) driverProbes() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.optionCalls
+}
+
+func (f *fakeCUPS) renders() []renderCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]renderCall(nil), f.renderCalls...)
 }
 
 // stationWithDriver is the standard two-printer station with a named driver on
@@ -798,8 +841,8 @@ func TestPrintPDFSpoolsADocumentWithoutRaw(t *testing.T) {
 	}
 }
 
-// @lat: [[tests#Agent Core#Print PDF Counter Rotates An Inverting Driver]]
-func TestPrintPDFCounterRotatesAnInvertingDriver(t *testing.T) {
+// @lat: [[tests#Agent Core#Print PDF Converts An Inverting Driver To Inline Graphics]]
+func TestPrintPDFConvertsAnInvertingDriverToInlineGraphics(t *testing.T) {
 	fake := stationWithDriver(zplModel)
 	base, _ := startAgent(t, fake, nil)
 
@@ -812,13 +855,14 @@ func TestPrintPDFCounterRotatesAnInvertingDriver(t *testing.T) {
 	}
 
 	calls := fake.calls()
-	if len(calls) != 1 {
-		t.Fatalf("lp calls = %d, want exactly one", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("lp calls = %d, want inline ZPL followed by saved-state restoration",
+			len(calls))
 	}
 	argv := calls[0].Args
-	want := []string{"-d", usbQueue, "-o", "orientation-requested=6"}
+	want := []string{"-d", usbQueue, "-o", "raw"}
 	if len(argv) != len(want)+1 {
-		t.Fatalf("lp argv = %v, want -d <queue> -o orientation-requested=6 <file>", argv)
+		t.Fatalf("lp argv = %v, want -d <queue> -o raw <file>", argv)
 	}
 	for index, expected := range want {
 		if argv[index] != expected {
@@ -826,16 +870,20 @@ func TestPrintPDFCounterRotatesAnInvertingDriver(t *testing.T) {
 		}
 	}
 
-	// The counter-rotation must not have smuggled `-o raw` back onto this route:
-	// the option only works BECAUSE the filter chain runs, and raw would skip it.
-	for _, arg := range argv {
-		if arg == "raw" {
-			t.Fatalf("lp argv = %v, want NO -o raw on a rendered document", argv)
-		}
+	renders := fake.renders()
+	if len(renders) != 1 || renders[0].Queue != usbQueue ||
+		!bytes.Equal(renders[0].Document, samplePDF) {
+		t.Fatalf("offline renders = %+v, want the PDF rendered once for %s", renders, usbQueue)
 	}
-	if !bytes.Equal(calls[0].Payload, samplePDF) {
-		t.Fatalf("spooled %d bytes, want the %d-byte decoded PDF verbatim",
-			len(calls[0].Payload), len(samplePDF))
+	wantPayload := "^XA\n^PON\n^PW8\n^LH0,0\n^LL2\n^MNY\n" +
+		"^FO0,0^GFA,2,2,1,1002^FS\n^XZ\n"
+	if string(calls[0].Payload) != wantPayload {
+		t.Fatalf("inline payload = %q, want %q", calls[0].Payload, wantPayload)
+	}
+	for _, forbidden := range []string{"~DG", "^XG", "^ID", "^POI"} {
+		if bytes.Contains(calls[0].Payload, []byte(forbidden)) {
+			t.Fatalf("inline payload contains forbidden stored/inverting command %q", forbidden)
+		}
 	}
 
 	// /write is untouched by the driver: ZPL is printer-native, the caller has
@@ -852,6 +900,191 @@ func TestPrintPDFCounterRotatesAnInvertingDriver(t *testing.T) {
 	}
 	if strings.Contains(rawArgv, "orientation-requested") {
 		t.Fatalf("/write lp argv = %q, want NO orientation option on the raw path", rawArgv)
+	}
+}
+
+// @lat: [[tests#Agent Core#Raster Label Transformation Is Bounded And Fail Closed]]
+func TestRasterLabelTransformationIsBoundedAndFailClosed(t *testing.T) {
+	t.Run("decodes classic runs and preserves allowlisted settings", func(t *testing.T) {
+		input := "~SD15\n~DGR:CUPS.GRF,3,3,\nJ0HF^XA\n" +
+			"^POI\n^PW24\n^PR4,4,4\n^LH0,0\n^LL1\n^MNN\n" +
+			"^LT0\n^MTD\n^MMT,Y\n~TA005\n^JZY\n^PQ2, 0, 0, N\n" +
+			"^FO0,0^XGR:CUPS.GRF,1,1^FS\n^XZ\n" +
+			"^XA\n^IDR:CUPS.GRF^FS\n^XZ\n^CN1\n"
+		output, err := transformRasterLabelZPL([]byte(input))
+		if err != nil {
+			t.Fatalf("transformRasterLabelZPL: %v", err)
+		}
+		text := string(output)
+		for _, want := range []string{
+			"~SD15\n^XA\n^PON\n^PW24\n^PR4,4,4\n^LH0,0\n^LL1\n^MNN\n",
+			"^LT0\n^MTD\n^MMT,Y\n~TA005\n^JZY\n^PQ2, 0, 0, N\n",
+			"^FO0,0^GFA,3,3,3,FF0000^FS\n^XZ\n^CN1\n",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("output missing %q: %q", want, text)
+			}
+		}
+	})
+
+	t.Run("rotates pixels and splits at the graphic field limit", func(t *testing.T) {
+		// 667 rows at 150 bytes each requires a 99,900-byte field followed by
+		// one 150-byte field. The first blank row is ',' and ':' repeats it.
+		input := fmt.Sprintf("~DGR:CUPS.GRF,100050,150,\n,%s^XA\n", strings.Repeat(":", 666)) +
+			"^POI\n^PW1200\n^LH0,0\n^MNY\n" +
+			"^FO0,0^XGR:CUPS.GRF,1,1^FS\n^XZ\n" +
+			"^XA\n^IDR:CUPS.GRF^FS\n^XZ\n"
+		output, err := transformRasterLabelZPL([]byte(input))
+		if err != nil {
+			t.Fatalf("transformRasterLabelZPL: %v", err)
+		}
+		text := string(output)
+		if strings.Count(text, "^GFA,") != 2 {
+			t.Fatalf("^GFA fields = %d, want 2", strings.Count(text, "^GFA,"))
+		}
+		for _, want := range []string{
+			"^PON\n^PW1200\n^LH0,0\n^LL667\n^MNY\n",
+			"^FO0,0^GFA,99900,99900,150,",
+			"^FO0,666^GFA,150,150,150,",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("output missing %q", want)
+			}
+		}
+		if len(output) > maxWriteBody {
+			t.Fatalf("output bytes = %d, want <= %d", len(output), maxWriteBody)
+		}
+	})
+
+	t.Run("keeps multiple pages as separate bounded formats", func(t *testing.T) {
+		output, err := transformRasterLabelZPL([]byte(sampleRasterLabelZPL + sampleRasterLabelZPL))
+		if err != nil {
+			t.Fatalf("transformRasterLabelZPL: %v", err)
+		}
+		if formats := strings.Count(string(output), "^XA\n"); formats != 2 {
+			t.Fatalf("formats = %d, want 2", formats)
+		}
+		if fields := strings.Count(string(output), "^GFA,"); fields != 2 {
+			t.Fatalf("^GFA fields = %d, want 2", fields)
+		}
+	})
+
+	t.Run("rejects anything outside the captured grammar", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			input string
+		}{
+			{"unexpected command", strings.Replace(sampleRasterLabelZPL,
+				"^FO0,0^XGR:CUPS.GRF,1,1^FS", "^FO1,0^XGR:CUPS.GRF,1,1^FS", 1)},
+			{"wrong declared length", strings.Replace(sampleRasterLabelZPL,
+				"~DGR:CUPS.GRF,2,1,", "~DGR:CUPS.GRF,3,1,", 1)},
+			{"pixel outside print width", strings.Replace(sampleRasterLabelZPL,
+				"4008^XA\n^POI\n^PW8", "4001^XA\n^POI\n^PW7", 1)},
+			{"binary output", sampleRasterLabelZPL + "\x00"},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				if _, err := transformRasterLabelZPL([]byte(testCase.input)); err == nil {
+					t.Fatal("transformRasterLabelZPL succeeded, want a fail-closed error")
+				}
+			})
+		}
+	})
+}
+
+// @lat: [[tests#Agent Core#Print PDF Rejects Unsafe Filter Output Before Spooling]]
+func TestPrintPDFRejectsUnsafeFilterOutputBeforeSpooling(t *testing.T) {
+	fake := stationWithDriver(zplModel)
+	fake.renderedZPL = []byte("^XA\n^FO0,0^FDnot captured rastertolabel output^FS\n^XZ\n")
+	base, _ := startAgent(t, fake, nil)
+
+	status, body := postPrintPDF(t, base, "https://lab.example", map[string]any{
+		"device": map[string]any{"uid": stableUID(usbQueue, usbURI), "name": usbQueue},
+		"data":   base64.StdEncoding.EncodeToString(samplePDF),
+	})
+	if status != http.StatusInternalServerError || !strings.Contains(body, "transform inverting PDF") {
+		t.Fatalf("/print-pdf = %d %q, want fail-closed transform error", status, body)
+	}
+	if calls := fake.calls(); len(calls) != 0 {
+		t.Fatalf("lp calls = %v, want none for unsafe filter output", calls)
+	}
+	if renders := fake.renders(); len(renders) != 1 {
+		t.Fatalf("offline renders = %d, want exactly one", len(renders))
+	}
+}
+
+// @lat: [[tests#Agent Core#Queue PPD Validation Pins The Stock ZPL Filter]]
+func TestQueuePPDValidationPinsTheStockZPLFilter(t *testing.T) {
+	valid := []byte("*NickName: \"Zebra ZPL Label Printer\"\n" +
+		"*cupsModelNumber: 18\n" +
+		"*cupsFilter: \"application/vnd.cups-raster 50 rastertolabel\"\n")
+	if err := validateRasterToLabelPPD(valid); err != nil {
+		t.Fatalf("validateRasterToLabelPPD(valid): %v", err)
+	}
+	for _, missing := range []string{"*NickName", "*cupsModelNumber", "*cupsFilter"} {
+		t.Run(missing, func(t *testing.T) {
+			lines := strings.Split(string(valid), "\n")
+			var incomplete strings.Builder
+			for _, line := range lines {
+				if !strings.HasPrefix(line, missing) && line != "" {
+					incomplete.WriteString(line + "\n")
+				}
+			}
+			if err := validateRasterToLabelPPD([]byte(incomplete.String())); err == nil {
+				t.Fatal("validateRasterToLabelPPD succeeded with a required directive missing")
+			}
+		})
+	}
+	for _, queue := range []string{"", "../printer", "printer/name", "printer name"} {
+		if _, err := queuePPDPath(queue); err == nil {
+			t.Fatalf("queuePPDPath(%q) succeeded, want rejection", queue)
+		}
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Restores Saved Printer Orientation]]
+func TestPrintPDFRestoresSavedPrinterOrientation(t *testing.T) {
+	cases := []struct {
+		name        string
+		inverting   bool
+		wantCalls   int
+		wantRestore bool
+	}{
+		{name: "inverting driver", inverting: true, wantCalls: 2, wantRestore: true},
+		{name: "non-inverting driver", inverting: false, wantCalls: 1},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fake := twoPrinterCUPS(stateEnabled, stateEnabled)
+			client := newCUPSClient(fake)
+			if _, err := client.printDocument(context.Background(), usbQueue, samplePDF,
+				testCase.inverting); err != nil {
+				t.Fatalf("printDocument: %v", err)
+			}
+
+			calls := fake.calls()
+			if len(calls) != testCase.wantCalls {
+				t.Fatalf("lp calls = %d, want %d", len(calls), testCase.wantCalls)
+			}
+			if !testCase.wantRestore {
+				if bytes.Equal(calls[0].Payload, []byte(restoreSavedConfiguration)) {
+					t.Fatal("non-inverting document was replaced by a restoration job")
+				}
+				return
+			}
+
+			restore := calls[1]
+			if !bytes.Equal(restore.Payload, []byte(restoreSavedConfiguration)) {
+				t.Fatalf("restore payload = %q, want %q", restore.Payload,
+					restoreSavedConfiguration)
+			}
+			argv := restore.Args
+			if len(argv) != 5 || argv[0] != "-d" || argv[1] != usbQueue ||
+				argv[2] != "-o" || argv[3] != "raw" {
+				t.Fatalf("restore lp argv = %v, want -d <queue> -o raw <file>", argv)
+			}
+		})
 	}
 }
 
@@ -908,6 +1141,9 @@ func TestPrintPDFLeavesANonInvertingDriverAlone(t *testing.T) {
 			}
 			if strings.Contains(strings.Join(argv, " "), "orientation") {
 				t.Fatalf("lp argv = %v, want NO orientation option", argv)
+			}
+			if renders := fake.renders(); len(renders) != 0 {
+				t.Fatalf("offline renders = %d, want none for a non-inverting driver", len(renders))
 			}
 		})
 	}
