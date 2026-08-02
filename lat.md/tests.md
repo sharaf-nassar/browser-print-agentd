@@ -43,6 +43,14 @@ Verifies `[[cups.go#parseQueueAccepting]]` reads the `lpstat -a` accepting and n
 forms, and that a `cupsreject`ed queue — which still reads enabled to `lpstat -p` — is excluded
 from the healthy set by that separate check.
 
+### Offline Queue Is Unhealthy
+
+Verifies a real-shape `lpstat -l -p` response carrying `The printer is offline.` and its
+`offline-report` alert overrides the enabled and accepting states.
+
+The offline queue is omitted from `/available` and `/default`, `/write` fails over, and no
+healthy destination fails loudly.
+
 ### Device URI Discovery And Classification
 
 Verifies `[[cups.go#parseDeviceURIs]]` parses `lpstat -v` rows, that

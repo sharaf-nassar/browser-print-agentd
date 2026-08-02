@@ -46,6 +46,8 @@ prints is vestigial and must never be probed as a capability.
 Status is read out of the printed TEXT, never the exit code. `[[cups.go#parseQueueEnabled]]`
 matches `printer NAME is idle.  enabled since <date>` (two spaces after `idle.`) against
 `printer NAME disabled since <date> -` plus its tab-indented `reason unknown` continuation;
+`[[cups.go#parseQueueOffline]]` reads the `lpstat -l -p` status `The printer is offline.` and the
+`offline-report` alert that CUPS emits while leaving an unreachable device enabled;
 `[[cups.go#parseQueueAccepting]]` reads `NAME accepting requests since <date>` against
 `NAME not accepting requests since <date> -` plus its `Rejecting Jobs` continuation, checking the
 negative form first because the rejecting line contains the accepting line's words. Anything
@@ -100,18 +102,20 @@ uid, so the operator re-picks once.
 
 ## Health And Failover
 
-`[[health.go#healthChecker#healthy]]` calls a queue usable only when it is present, enabled, AND
-accepting requests, and `[[health.go#healthChecker#healthyPrinters]]` filters discovery down to
-that set while preserving USB-first order.
+`[[health.go#healthChecker#healthy]]` calls a queue usable only when it is present, enabled,
+online, AND accepting requests, and `[[health.go#healthChecker#healthyPrinters]]` filters
+discovery down to that set while preserving USB-first order.
 
-All three conditions are required because CUPS hides two separate failures. A DISABLED queue
+All four conditions are required because CUPS hides three separate failures. A DISABLED queue
 exits 0 from `lpstat -p` and only an ABSENT queue exits 1, so the exit code carries exactly one
 bit and health has to come from the text — trusting the exit code is what produced the original
 silent-success bug, where a dead USB queue advertised itself, `lp` accepted the job, and the
 caller reported "Sent" for a label that never printed. Separately, a `cupsreject`ed queue still
 reads `enabled` to `lpstat -p` while rejecting every job handed to it, which is invisible without
-the second `lpstat -a` check. Probes run concurrently under a per-command timeout so a wedged USB
-device reads as unhealthy instead of blocking the caller's 1500 ms reachability probe.
+the second `lpstat -a` check. An unreachable device can remain both enabled and accepting, so the
+`lpstat -l -p` status and alerts must also be checked. Probes run concurrently under a
+per-command timeout so a wedged USB device reads as unhealthy instead of blocking the caller's
+1500 ms reachability probe.
 
 `[[server.go#agent#resolveTarget]]` is the deliberate divergence: the reference implementation
 500s a `/write` naming a dead queue, while this agent falls over to the next healthy printer (USB

@@ -19,6 +19,9 @@ import (
 //	printer zd621_net is idle.  enabled since Fri Jul 24 16:02:07 2026
 //	printer zd621_net disabled since Fri Jul 24 16:02:21 2026 -
 //	<TAB>reason unknown
+//	printer zd621_usb is idle.  enabled since Fri Jul 24 16:02:07 2026
+//	<TAB>The printer is offline.
+//	<TAB>Alerts: offline-report connecting-to-device
 //	lpstat: Invalid destination name in list "nosuchqueue".
 //	zd621_net accepting requests since Fri Jul 24 16:02:07 2026
 //	zd621_net not accepting requests since Fri Jul 24 16:02:21 2026 -
@@ -40,6 +43,8 @@ const (
 	// produce a phantom success.
 	enabledMarker  = "enabled since"
 	disabledMarker = "disabled since"
+	offlineStatus  = "The printer is offline."
+	offlineAlert   = "offline-report"
 
 	// deviceURIPrefix introduces every `lpstat -v` line: "device for <queue>: <uri>".
 	deviceURIPrefix = "device for "
@@ -160,22 +165,24 @@ func (c *cupsClient) runFor(
 	return c.runner.Run(ctx, name, args...)
 }
 
-// queueEnabled reports whether the queue exists AND is enabled.
+// queueOnline reports whether the queue exists, is enabled, and has no CUPS
+// offline status or alert.
 //
 // The exit code carries exactly one bit and it is NOT health: a DISABLED queue
 // exits 0 and an ABSENT queue exits 1. Trusting the exit code is what produced
 // the silent-success bug this agent exists to kill, so the enabled/disabled
 // verdict comes from the printed text and the exit code only rules out an
 // absent queue.
-func (c *cupsClient) queueEnabled(ctx context.Context, queue string) (bool, error) {
-	result, err := c.run(ctx, "lpstat", "-p", queue)
+func (c *cupsClient) queueOnline(ctx context.Context, queue string) (bool, error) {
+	result, err := c.run(ctx, "lpstat", "-l", "-p", queue)
 	if err != nil {
 		return false, err
 	}
 	if result.ExitCode != 0 {
 		return false, nil
 	}
-	return parseQueueEnabled(result.Stdout, queue), nil
+	return parseQueueEnabled(result.Stdout, queue) &&
+		!parseQueueOffline(result.Stdout, queue), nil
 }
 
 // queueAccepting reports whether the queue is accepting new jobs.
@@ -318,6 +325,33 @@ func parseQueueEnabled(output string, queue string) bool {
 			return false
 		}
 		return strings.Contains(state, enabledMarker)
+	}
+	return false
+}
+
+// parseQueueOffline reads the long `lpstat -l -p` status attached to queue.
+// CUPS leaves an unreachable device enabled, so its explicit offline status or
+// offline-report alert must override the enabled header. Status belonging to a
+// different queue is ignored.
+func parseQueueOffline(output string, queue string) bool {
+	selected := false
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "printer" {
+			selected = fields[1] == queue
+			continue
+		}
+		if !selected {
+			continue
+		}
+		status := strings.TrimSpace(line)
+		if status == offlineStatus {
+			return true
+		}
+		if strings.HasPrefix(status, "Alerts:") &&
+			strings.Contains(status, offlineAlert) {
+			return true
+		}
 	}
 	return false
 }

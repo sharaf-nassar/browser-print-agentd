@@ -41,9 +41,11 @@ const (
 	netURI    = "socket://192.0.2.111:9100"
 
 	// Spike output shape. Note the two spaces after "idle.", the trailing " -"
-	// on both unhappy forms, and their tab-indented continuation lines.
-	enabledLine   = "printer %s is idle.  enabled since Fri Jul 24 16:02:07 2026\n"
-	disabledLine  = "printer %s disabled since Fri Jul 24 16:02:21 2026 -\n\treason unknown\n"
+	// on the disabled form, and the tab-indented continuation lines.
+	enabledLine  = "printer %s is idle.  enabled since Fri Jul 24 16:02:07 2026\n"
+	disabledLine = "printer %s disabled since Fri Jul 24 16:02:21 2026 -\n\treason unknown\n"
+	offlineLine  = "printer %s is idle.  enabled since Fri Jul 24 16:02:07 2026\n" +
+		"\tThe printer is offline.\n\tAlerts: offline-report connecting-to-device\n"
 	absentLine    = "lpstat: Invalid destination name in list \"%s\".\n"
 	acceptingLine = "%s accepting requests since Fri Jul 24 16:02:07 2026\n"
 	rejectingLine = "%s not accepting requests since Fri Jul 24 16:02:21 2026 -\n\tRejecting Jobs\n"
@@ -82,6 +84,7 @@ const (
 const (
 	stateEnabled   = "enabled"
 	stateDisabled  = "disabled"
+	stateOffline   = "offline"
 	stateRejecting = "rejecting"
 	stateAbsent    = "absent"
 )
@@ -161,10 +164,16 @@ func (f *fakeCUPS) lpstat(args []string) (execResult, error) {
 		}
 		return execResult{Stdout: out.String()}, nil
 	}
-	if len(args) < 2 {
+	longStatus := len(args) >= 3 && args[0] == "-l" && args[1] == "-p"
+	shortStatus := len(args) >= 2 && args[0] == "-p"
+	acceptingStatus := len(args) >= 2 && args[0] == "-a"
+	if !longStatus && !shortStatus && !acceptingStatus {
 		return execResult{ExitCode: 1}, nil
 	}
 	queue := args[1]
+	if longStatus {
+		queue = args[2]
+	}
 	state, listed := f.states[queue]
 	if !listed {
 		state = stateAbsent
@@ -172,15 +181,18 @@ func (f *fakeCUPS) lpstat(args []string) (execResult, error) {
 	if state == stateAbsent {
 		return execResult{ExitCode: 1, Stderr: fmt.Sprintf(absentLine, queue)}, nil
 	}
-	switch args[0] {
-	case "-p":
+	switch {
+	case longStatus || shortStatus:
 		// A disabled queue exits 0 exactly like an enabled one — the trap this
 		// suite guards.
 		if state == stateDisabled {
 			return execResult{Stdout: fmt.Sprintf(disabledLine, queue)}, nil
 		}
+		if longStatus && state == stateOffline {
+			return execResult{Stdout: fmt.Sprintf(offlineLine, queue)}, nil
+		}
 		return execResult{Stdout: fmt.Sprintf(enabledLine, queue)}, nil
-	case "-a":
+	case acceptingStatus:
 		// A rejecting queue reads enabled to `lpstat -p`; only `-a` reveals it.
 		if state == stateRejecting {
 			return execResult{Stdout: fmt.Sprintf(rejectingLine, queue)}, nil
@@ -393,12 +405,12 @@ func TestRejectingQueueIsUnhealthy(t *testing.T) {
 	// check keeps it out of the healthy set.
 	fake := twoPrinterCUPS(stateRejecting, stateEnabled)
 	cups := newCUPSClient(fake)
-	enabled, err := cups.queueEnabled(context.Background(), usbQueue)
+	online, err := cups.queueOnline(context.Background(), usbQueue)
 	if err != nil {
-		t.Fatalf("queueEnabled: %v", err)
+		t.Fatalf("queueOnline: %v", err)
 	}
-	if !enabled {
-		t.Fatal("rejecting queue should still read enabled to lpstat -p")
+	if !online {
+		t.Fatal("rejecting queue should still read online to lpstat -l -p")
 	}
 	health := newHealthChecker(cups)
 	health.ttl = 0
@@ -407,6 +419,64 @@ func TestRejectingQueueIsUnhealthy(t *testing.T) {
 	}
 	if !health.healthy(context.Background(), netQueue) {
 		t.Fatal("an enabled, accepting queue must be healthy")
+	}
+}
+
+// @lat: [[tests#Agent Core#Offline Queue Is Unhealthy]]
+func TestOfflineQueueIsUnhealthy(t *testing.T) {
+	// This is the long `lpstat -l -p` shape captured with the device powered
+	// off: CUPS keeps the queue enabled while reporting the failure only in its
+	// continuation status and alerts.
+	offline := fmt.Sprintf(offlineLine, usbQueue)
+	if !parseQueueEnabled(offline, usbQueue) {
+		t.Fatal("offline queue should still parse as enabled")
+	}
+	if !parseQueueOffline(offline, usbQueue) {
+		t.Fatal("offline status line must make the queue unavailable")
+	}
+
+	fake := twoPrinterCUPS(stateOffline, stateEnabled)
+	base, _ := startAgent(t, fake, nil)
+
+	_, body := getPath(t, base, "/available")
+	var available struct {
+		Printer []wireDevice `json:"printer"`
+	}
+	if err := json.Unmarshal([]byte(body), &available); err != nil {
+		t.Fatalf("decode /available %q: %v", body, err)
+	}
+	if len(available.Printer) != 1 || available.Printer[0].Name != netQueue {
+		t.Fatalf("/available = %+v, want only the healthy network queue",
+			available.Printer)
+	}
+
+	_, body = getPath(t, base, "/default?type=printer")
+	var defaultPrinter wireDevice
+	if err := json.Unmarshal([]byte(body), &defaultPrinter); err != nil {
+		t.Fatalf("decode /default %q: %v", body, err)
+	}
+	if defaultPrinter.Name != netQueue {
+		t.Fatalf("/default = %+v, want the healthy network queue", defaultPrinter)
+	}
+
+	status, body := postWrite(t, base, "", map[string]any{
+		"device": map[string]any{
+			"uid": stableUID(usbQueue, usbURI), "name": usbQueue,
+		},
+		"data": "^XA^XZ",
+	})
+	calls := fake.calls()
+	if status != http.StatusOK || len(calls) != 1 || calls[0].Args[1] != netQueue {
+		t.Fatalf("/write failover = %d %q calls %v, want network 200",
+			status, body, calls)
+	}
+
+	dead := twoPrinterCUPS(stateOffline, stateOffline)
+	deadBase, _ := startAgent(t, dead, nil)
+	status, body = postWrite(t, deadBase, "", map[string]any{"data": "^XA^XZ"})
+	if status < 400 || len(dead.calls()) != 0 {
+		t.Fatalf("/write with offline printers = %d %q calls %v, want failure",
+			status, body, dead.calls())
 	}
 }
 

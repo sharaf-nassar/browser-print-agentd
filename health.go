@@ -48,17 +48,19 @@ func newHealthChecker(cups *cupsClient) *healthChecker {
 	}
 }
 
-// healthy reports whether the queue can print: it must be present, enabled, AND
-// accepting requests.
+// healthy reports whether the queue can print: it must be present, enabled,
+// online, AND accepting requests.
 //
-// All three are required because CUPS hides two distinct failures. A disabled
+// All four are required because CUPS hides three distinct failures. A disabled
 // queue exits 0 from `lpstat -p`, so the exit code cannot be trusted; and a
 // `cupsreject`ed queue still reads "enabled" (observed on macOS 26.4: `lpstat
 // -p` prints "is idle. ... Rejecting Jobs" with "enabled since" and exits 0),
 // so `-p` alone reports it as healthy. `lpstat -a` is a separate mandatory
-// check because it is the only probe that catches that rejection. Any probe
-// error (missing binary, hung device blowing the command timeout) reads as
-// unhealthy — never as a printable queue.
+// check because it is the only probe that catches that rejection. An
+// unreachable device can remain enabled and accepting, so long `lpstat -l -p`
+// status is also required to rule out its offline status. Any probe error
+// (missing binary, hung device blowing the command timeout) reads as unhealthy
+// — never as a printable queue.
 func (h *healthChecker) healthy(ctx context.Context, queue string) bool {
 	now := h.now()
 	h.mu.Lock()
@@ -69,8 +71,8 @@ func (h *healthChecker) healthy(ctx context.Context, queue string) bool {
 	}
 
 	healthy := false
-	enabled, err := h.cups.queueEnabled(ctx, queue)
-	if err == nil && enabled {
+	online, err := h.cups.queueOnline(ctx, queue)
+	if err == nil && online {
 		accepting, err := h.cups.queueAccepting(ctx, queue)
 		healthy = err == nil && accepting
 	}
