@@ -49,6 +49,7 @@ UPDATER_PLIST_PATH="/Library/LaunchDaemons/${UPDATER_PLIST_NAME}"
 # per-account support and log directories below.
 SYSTEM_SUPPORT_DIR="/Library/Application Support/${PRODUCT_NAME}"
 UPDATE_STATE_DIR="${SYSTEM_SUPPORT_DIR}/updater"
+UPDATE_STATUS_PATH="${SYSTEM_SUPPORT_DIR}/update-status"
 SYSTEM_LOG_DIR="/Library/Logs/${PRODUCT_NAME}"
 
 # Per-account directories, relative to a home directory. Names only: the home

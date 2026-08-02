@@ -27,6 +27,7 @@ MANIFEST_URL="$RELEASES_URL/latest/download/update-manifest.txt"
 
 BAD_VERSIONS="$STATE_DIR/quarantined-versions"
 STATUS_FILE="$STATE_DIR/last-run.txt"
+PUBLIC_STATUS_FILE="__UPDATE_STATUS_PATH__"
 CACHE_PKG="$STATE_DIR/good.pkg"
 CACHE_VERSION="$STATE_DIR/good.version"
 CACHE_SHA256="$STATE_DIR/good.sha256"
@@ -57,7 +58,8 @@ for path in "$STATE_ROOT" "$STATE_DIR" "$LOG_DIR"; do
 done
 /bin/mkdir -p "$STATE_DIR" "$LOG_DIR"
 /usr/sbin/chown root:wheel "$STATE_ROOT" "$STATE_DIR" "$LOG_DIR"
-/bin/chmod 700 "$STATE_ROOT" "$STATE_DIR"
+/bin/chmod 755 "$STATE_ROOT"
+/bin/chmod 700 "$STATE_DIR"
 /bin/chmod 755 "$LOG_DIR"
 if [ -L "$LOG_FILE" ]; then
 	/bin/rm -f "$LOG_FILE"
@@ -84,14 +86,34 @@ valid_sha256() {
 write_status() {
 	status="$1"
 	status_version="$2"
+	timestamp="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
 	tmp="$(/usr/bin/mktemp "$STATE_DIR/.last-run.XXXXXX")" || return 1
 	{
-		printf 'timestamp=%s\n' "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
+		printf 'timestamp=%s\n' "$timestamp"
 		printf 'status=%s\n' "$status"
 		printf 'version=%s\n' "$status_version"
 	} >"$tmp"
 	/bin/chmod 600 "$tmp"
 	/bin/mv -f "$tmp" "$STATUS_FILE"
+
+	# Publish only bounded diagnostic facts. The private quarantine list,
+	# rollback package, signature identity, and updater controls stay below the
+	# mode-700 state directory. Pin truth is deliberately not written here: once
+	# launchd disables this job it cannot run again to update a file, so /health
+	# reads that fact live from launchd instead.
+	if [ -L "$PUBLIC_STATUS_FILE" ]; then
+		/bin/rm -f "$PUBLIC_STATUS_FILE"
+	fi
+	public_tmp="$(/usr/bin/mktemp "$STATE_ROOT/.update-status.XXXXXX")" || return 1
+	{
+		printf 'timestamp=%s\n' "$timestamp"
+		printf 'status=%s\n' "$status"
+		printf 'latest-version=%s\n' "$LATEST_VERSION"
+		printf 'latest-quarantined=%s\n' "$LATEST_QUARANTINED"
+	} >"$public_tmp"
+	/usr/sbin/chown root:wheel "$public_tmp"
+	/bin/chmod 644 "$public_tmp"
+	/bin/mv -f "$public_tmp" "$PUBLIC_STATUS_FILE"
 }
 
 resolve_console_user() {
@@ -313,6 +335,12 @@ rollback_failed_update() {
 	log "rollback to $old_version succeeded"
 }
 
+# Unknown is a real state before a manifest has passed strict validation. It is
+# safer than labelling the installed version "latest" after a skipped or failed
+# check. Once parsed, these values describe the manifest-selected release only.
+LATEST_VERSION=""
+LATEST_QUARANTINED=unknown
+
 if [ -e "$INSTALL_MARKER" ]; then
 	log "another product install is in progress; skipping"
 	write_status skipped-install ""
@@ -361,6 +389,13 @@ if ! parse_manifest "$TMP_DIR/update-manifest.txt"; then
 	fail "update-manifest.txt failed strict validation"
 fi
 
+LATEST_VERSION="$manifest_version"
+if version_is_quarantined "$manifest_version"; then
+	LATEST_QUARANTINED=true
+else
+	LATEST_QUARANTINED=false
+fi
+
 if [ "$manifest_version" = "$INSTALLED_VERSION" ]; then
 	log "version $INSTALLED_VERSION is current"
 	write_status current "$INSTALLED_VERSION"
@@ -403,6 +438,7 @@ if install_package "$TMP_DIR/update.pkg" && probe_version "$manifest_version"; t
 fi
 
 quarantine_version "$manifest_version"
+LATEST_QUARANTINED=true
 write_status install-failed "$manifest_version"
 if rollback_failed_update "$manifest_version" "$INSTALLED_VERSION"; then
 	write_status rolled-back "$manifest_version"

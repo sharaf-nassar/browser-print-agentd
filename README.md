@@ -35,7 +35,7 @@ them answers those paths with the plain-text `404` its default arm has always pr
 | `GET`  | `/default`    | one `Device` object, or an **empty body** when nothing is healthy (an empty JSON object here would break callers)         |
 | `POST` | `/write`      | spools `{"data": "<raw ZPL>"}` to the requested (or resolved) printer; empty `200` on success, plain-text body on failure |
 | `POST` | `/read`       | empty `200` — dead surface for most callers, kept so the agent stays a drop-in                                            |
-| `GET`  | `/health`     | **additive** diagnostics: running version, origin posture, and **every** discovered queue with its health verdict         |
+| `GET`  | `/health`     | **additive** diagnostics: running version, origin posture, every queue's health, and updater status when safely available |
 | `POST` | `/print-pdf`  | **additive**: spools `{"data": "<base64 PDF>"}` as a rendered document; same `200`/plain-text convention as `/write`      |
 
 `OPTIONS` on any path answers the CORS preflight with `204`.
@@ -60,6 +60,14 @@ bridge between the local browser and local CUPS, never a network service.
 `X-Print-Agent-Version`. That header and `GET /health` are the *only* places the running version
 is reported: the `Device` shape must never grow a version field, because callers parse and pin
 it. A binary built any way other than a tagged release reports `dev`.
+
+**Update diagnostics.** When the packaged root updater has published valid local state,
+`GET /health` adds an `update` object with its last-check time and outcome, the latest strictly
+validated manifest version, whether that version is quarantined, and whether launchd currently
+pins the updater disabled. The print agent makes no network request for this: it reads one
+sanitized root-owned file and launchd's local disabled-state dictionary. Missing, malformed,
+unsafe, or unprovable state omits `update` entirely. A check that ended before manifest
+validation omits `latestVersion` and `quarantined` rather than guessing.
 
 **Origin posture.** With no `--origin-allow` configured the agent is `log-and-allow`: every
 origin is recorded and permitted. Configure an allowlist and both print routes — `/write` and
@@ -100,6 +108,7 @@ Installed layout:
 | `/Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist` | root updater LaunchDaemon         |
 | `~/Library/Application Support/browser-print-agentd/`                              | `cert.pem` and `key.pem`          |
 | `~/Library/Logs/browser-print-agentd/`                                             | per-user agent log                |
+| `/Library/Application Support/browser-print-agentd/update-status`                  | sanitized updater diagnostics     |
 | `/Library/Application Support/browser-print-agentd/updater/`                       | updater cache and state           |
 | `/Library/Logs/browser-print-agentd/update.log`                                    | updater verification/install log |
 
@@ -109,6 +118,11 @@ does nothing without a console user. A strict three-line manifest at GitHub's
 including a downgrade when a bad latest release is yanked. Before replacement it caches and
 verifies the currently installed release package; an install or version-probe failure restores
 that package and quarantines the failed version from future attempts.
+
+Its public status file is root-owned mode 644 beneath a root-owned mode-755 support directory.
+The rollback cache, quarantine list, and detailed last-run state remain in the mode-700
+`updater/` child. Pin state is never copied into a stale file: `/health` reads launchd live,
+because a disabled updater cannot run again to rewrite its own publication.
 
 Pin a managed or rolled-back station with one command; package upgrades preserve this disabled
 override:

@@ -232,6 +232,7 @@ render_template() {
 		-e "s|__UPDATER_PLIST_PATH__|$UPDATER_PLIST_PATH|g" \
 		-e "s|__SYSTEM_SUPPORT_DIR__|$SYSTEM_SUPPORT_DIR|g" \
 		-e "s|__UPDATE_STATE_DIR__|$UPDATE_STATE_DIR|g" \
+		-e "s|__UPDATE_STATUS_PATH__|$UPDATE_STATUS_PATH|g" \
 		-e "s|__SYSTEM_LOG_DIR__|$SYSTEM_LOG_DIR|g" \
 		-e "s|__SUPPORT_DIR_NAME__|$SUPPORT_DIR_NAME|g" \
 		-e "s|__LOG_DIR_NAME__|$LOG_DIR_NAME|g" \

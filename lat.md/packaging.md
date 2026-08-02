@@ -13,7 +13,7 @@ The record is POSIX `sh` with no side effects, because it is sourced by both `bu
 the naming gate. It carries `PRODUCT_NAME`, `PRODUCT_TITLE`, `BUNDLE_ID` (used verbatim as both
 the launchd `Label` and the `productbuild` package identifier), `BINARY_NAME`, `BINARY_PATH`,
 `UNINSTALLER_NAME`/`UNINSTALLER_PATH`, `LIBEXEC_DIR`, `LAUNCHER_PATH`, `PLIST_NAME`,
-`AGENT_PLIST_PATH`, updater script/label/plist paths, root updater support/log paths,
+`AGENT_PLIST_PATH`, updater script/label/plist paths, public update-status path, root updater support/log paths,
 `SUPPORT_DIR_NAME`, `LOG_DIR_NAME`, `ENV_PREFIX`, `TARGET_USER_ENV`, `TEMP_PREFIX`, the derived
 GitHub release URL, `COMPONENT_PKG_NAME`, and the release-tag glob. Everything but the product
 name itself and the reverse-DNS namespace prefix is derived, so a rename is a one-line edit.
@@ -152,11 +152,14 @@ Bootstrap happens only after the print agent's own health probe, preserves launc
 override, and uses an install marker plus the updater's `installer`-process check to prevent the
 RunAtLoad execution from nesting inside the package installation that registered it.
 
-The root state directory is mode 700 and holds the strict status file, failed-version quarantine,
-and verified rollback package. The root log directory is distinct from every account's agent log.
-Both paths, both updater artifacts, the release feed URL, and the updater label derive from
-`identity.sh`; uninstall boots the system job out and removes its plist, state, cache, script, and
-log along with the original payload.
+The system support directory is root-owned mode 755 solely to provide traversal to one sanitized,
+root-owned mode-644 status file. Its `updater/` child remains mode 700 and holds the detailed
+last-run file, failed-version quarantine, and verified rollback package. The public file is
+atomically replaced and carries only bounded timestamp/outcome/latest-version/quarantine facts;
+it contains no package, quarantine list, Team ID, URL, credential, or updater control. The root
+log directory is distinct from every account's agent log. All paths, both updater artifacts, the
+release feed URL, and updater label derive from `identity.sh`; uninstall removes them with the
+original payload.
 
 ### Preinstall And Postinstall
 

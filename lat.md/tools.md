@@ -223,9 +223,8 @@ PDF instead of ZPL, so the check is structural and is asserted on both routes.
 
 ## Version And Health Surface
 
-`[[version.go#agent#handleHealth]]` answers `GET /health` with the running version, the origin
-posture, and every discovered queue flagged healthy or not — the diagnostics half of the two
-additive routes that sit beside the frozen contract.
+`[[version.go#agent#handleHealth]]` answers `GET /health` with the running version, origin posture,
+queue health, and safely provable local updater status.
 
 It is the inverse of `/available`, which hides unhealthy printers so a caller can never pin one,
 where triage needs to see exactly the queue that exists but cannot print. It still answers 200
@@ -237,3 +236,12 @@ The same version rides every response as `X-Print-Agent-Version`. `[[version.go#
 other build reports `dev`, so an unversioned binary on a station is identifiable as one. The
 version never enters the frozen `Device` shape, which callers parse and pin, so these two
 surfaces are the only version channel the product has.
+
+`[[update.go#updateReader#read]]` combines two authorities. The root updater's mode-644 public
+file supplies a bounded last-check timestamp, outcome, latest strictly validated manifest
+version, and boolean quarantine verdict; its mode-700 private sibling remains unreadable. A
+bounded `launchctl print-disabled system` supplies pin truth live. Pinning cannot safely be
+file-only: after `launchctl disable` the updater cannot run to rewrite its own file. Missing,
+unsafe, malformed, oversized, or ambiguous input therefore omits the `update` object through
+`omitempty` instead of failing `/health` or fabricating state. The agent performs no egress and
+exposes no update route.

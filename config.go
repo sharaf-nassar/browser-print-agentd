@@ -42,16 +42,26 @@ var (
 	originAllowEnvVar = envPrefix + "_ORIGIN_ALLOW"
 )
 
+// Package wiring rendered into the root-owned LaunchAgent plist. These are not
+// station configuration: they tell the binary where the updater publication
+// lives and which system-domain label launchd is authoritative for.
+var (
+	updateStatusEnvVar = envPrefix + "_UPDATE_STATUS_PATH"
+	updaterLabelEnvVar = envPrefix + "_UPDATER_LABEL"
+)
+
 // config is the resolved runtime configuration. Ports and bind address are
 // overridable per station without editing code; printer selection is NOT
 // configurable — the agent discovers queues from CUPS, unlike the dev shim's
 // hand-listed queue names.
 type config struct {
-	Bind        string
-	Port        int
-	HTTPSPort   int
-	CertDir     string
-	OriginAllow []string
+	Bind             string
+	Port             int
+	HTTPSPort        int
+	CertDir          string
+	OriginAllow      []string
+	UpdateStatusPath string
+	UpdaterLabel     string
 }
 
 // certPaths returns the cert/key pair the HTTPS listener needs.
@@ -63,10 +73,12 @@ func (c config) certPaths() (string, string) {
 // its environment mirror, which always wins over the built-in default.
 func parseConfig(args []string, env func(string) string, output io.Writer) (config, error) {
 	defaults := config{
-		Bind:      envString(env, bindEnvVar, defaultBind),
-		Port:      envInt(env, portEnvVar, defaultPort),
-		HTTPSPort: envInt(env, httpsPortEnvVar, defaultHTTPSPort),
-		CertDir:   envString(env, certDirEnvVar, defaultCertDir(env)),
+		Bind:             envString(env, bindEnvVar, defaultBind),
+		Port:             envInt(env, portEnvVar, defaultPort),
+		HTTPSPort:        envInt(env, httpsPortEnvVar, defaultHTTPSPort),
+		CertDir:          envString(env, certDirEnvVar, defaultCertDir(env)),
+		UpdateStatusPath: env(updateStatusEnvVar),
+		UpdaterLabel:     env(updaterLabelEnvVar),
 	}
 	originAllow := env(originAllowEnvVar)
 

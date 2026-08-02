@@ -71,6 +71,7 @@ type agent struct {
 	health  *healthChecker
 	drivers *driverChecker
 	logger  *agentLogger
+	updates *updateReader
 
 	// originAllow is the Q14 posture. Empty means log-and-allow: every origin is
 	// recorded and permitted. Non-empty turns /write into an allowlisted

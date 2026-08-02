@@ -75,6 +75,10 @@
 	<dict>
 		<key>PATH</key>
 		<string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+		<key>__ENV_PREFIX___UPDATE_STATUS_PATH</key>
+		<string>__UPDATE_STATUS_PATH__</string>
+		<key>__ENV_PREFIX___UPDATER_LABEL</key>
+		<string>__UPDATER_LABEL__</string>
 	</dict>
 
 	<key>RunAtLoad</key>

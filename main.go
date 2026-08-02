@@ -57,6 +57,12 @@ func run(config config) error {
 
 	logger := newAgentLogger(os.Stdout)
 	handler := newAgent(osRunner{}, logger, config.OriginAllow)
+	if config.UpdateStatusPath != "" && config.UpdaterLabel != "" {
+		handler.updates = &updateReader{
+			path:  config.UpdateStatusPath,
+			label: config.UpdaterLabel,
+		}
+	}
 
 	if len(config.OriginAllow) == 0 {
 		fmt.Fprintf(os.Stdout,

@@ -98,8 +98,8 @@ routes — and updating becomes the job of a separate root daemon. The frozen wi
 `Device` shape, and the no-downgrade-guard install-over-install path of
 [[operations#Station Operations#Rollback Path]] are all untouched, and pinning a station stays one
 command: `sudo launchctl disable system/<updater-label>`. Phase 1, release-side manifest and
-checksum assets, and phase 2, updater daemon plus runbook, are shipped. Phase 3 may add `/health`
-update visibility without changing the frozen device or request shapes.
+checksum assets, phase 2, updater daemon plus runbook, and phase 3, `/health` update visibility,
+are shipped without changing the frozen device or request shapes.
 
 ### The Adopted Updater Shape
 
@@ -146,9 +146,12 @@ retained release assets and put through the same digest, signature, Team ID, qua
 notarization gates. A successful update replaces the cache with the now-proven current package.
 It logs to `/Library/Logs/<product>/update.log`.
 
-Observability keeps the agent at zero egress: the updater writes a status file, and `/health` —
-an additive diagnostics surface, not part of the frozen wire contract — may later expose update
-status read from that file. The frozen `Device` object is untouched. On the release side the
+Observability keeps the agent at zero egress: the updater atomically publishes a sanitized status
+file outside its mode-700 private state, and `/health` — an additive diagnostics surface, not part
+of the frozen wire contract — exposes it only after strict bounded parsing. Pin state comes live
+from `launchctl print-disabled system`, because a disabled updater cannot rewrite a file after the
+one-command pin. If either source cannot prove its state, `update` is omitted rather than stale or
+fabricated. The frozen `Device` object is untouched. On the release side the
 tag-only trigger ([[infrastructure#Infrastructure#Release Chain#Trigger Surface]]) is preserved:
 each release additionally uploads `<pkg>.sha256` and `update-manifest.txt` as assets and marks
 the release `--latest` explicitly.

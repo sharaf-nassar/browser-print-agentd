@@ -156,6 +156,7 @@ Machine-wide payload and updater state:
 | `/usr/local/libexec/browser-print-agentd/updater` | short-lived root updater |
 | `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist` | per-user print job |
 | `/Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist` | system update job |
+| `/Library/Application Support/browser-print-agentd/update-status` | sanitized updater status read by `/health` |
 | `/Library/Application Support/browser-print-agentd/updater/` | verified rollback cache and state |
 | `/Library/Logs/browser-print-agentd/update.log` | updater log |
 
@@ -208,6 +209,11 @@ After installation it polls `/health` until `X-Print-Agent-Version` matches the 
 reinstalls the cached package and records the failed version in `quarantined-versions`, so that
 same version is not retried on every daily run.
 
+After each recorded outcome, the updater atomically publishes only its timestamp, outcome,
+latest strictly validated manifest version, and whether that version is quarantined. `/health`
+combines those facts with launchd's live disabled override. This keeps the agent at zero egress
+and keeps the cache, quarantine list, signing identity, and updater controls root-only.
+
 ### Pin or resume a station
 
 Pinning is one persistent launchd override. It survives package upgrades:
@@ -217,7 +223,9 @@ sudo launchctl disable system/io.github.sharaf-nassar.browser-print-agentd.updat
 ```
 
 The updater is short-lived, so the command prevents future launches; an update already inside
-`installer` is allowed to finish or roll back. Resume with:
+`installer` is allowed to finish or roll back. `/health` reports `"pinned":true` from launchd
+itself; it does not trust the updater's last file write, which necessarily predates a disable.
+Resume with:
 
 ```bash
 sudo launchctl enable system/io.github.sharaf-nassar.browser-print-agentd.updater
@@ -242,6 +250,7 @@ Updater state is root-owned:
 | Path | Meaning |
 | ---- | ------- |
 | `/Library/Logs/browser-print-agentd/update.log` | download, verification, install, and rollback trail |
+| `/Library/Application Support/browser-print-agentd/update-status` | mode-644 sanitized publication used by `/health` |
 | `/Library/Application Support/browser-print-agentd/updater/last-run.txt` | latest status, timestamp, and relevant version |
 | `/Library/Application Support/browser-print-agentd/updater/quarantined-versions` | versions suppressed after failed installation |
 | `/Library/Application Support/browser-print-agentd/updater/good.pkg` | verified package for rollback |
@@ -531,7 +540,10 @@ curl -fsS http://127.0.0.1:9100/health
 `GET /health` is always the first call. Unlike `/available`, which hides unhealthy printers so a
 caller can never pin one, `/health` lists **every** discovered queue with its verdict, and it
 answers 200 even when CUPS itself is unreachable. The same version rides every response as the
-`X-Print-Agent-Version` header.
+`X-Print-Agent-Version` header. When local updater state is valid, `update` also reports the last
+check, latest known release, quarantine verdict, and live launchd pin. Its absence means the
+updater/status is absent, unsafe, malformed, unreadable, or launchd pin truth could not be proven;
+it never makes the health request fail.
 
 If the agent answers but you are not sure it is *this* agent, see
 [Telling two agents apart](#telling-two-agents-apart).
@@ -539,14 +551,20 @@ If the agent answers but you are not sure it is *this* agent, see
 ### Updater troubleshooting
 
 The updater and agent are separate jobs. An updater failure does not add an HTTP route, change
-the frozen wire contract, or give the agent egress. Inspect root-owned updater state directly:
+the frozen wire contract, or give the agent egress. Start with the sanitized view, then inspect
+root-only detail when needed:
 
 ```bash
+curl -fsS http://127.0.0.1:9100/health
 sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | head -30
 sudo launchctl print-disabled system | grep io.github.sharaf-nassar.browser-print-agentd.updater
 sudo tail -100 /Library/Logs/browser-print-agentd/update.log
 sudo cat /Library/Application\ Support/browser-print-agentd/updater/last-run.txt
 ```
+
+`update.status` uses the same values below. `latestVersion` and `quarantined` are absent when a
+run skipped or failed before a manifest passed strict validation. `pinned` is always a live
+launchd verdict, not a value persisted by the updater.
 
 Common statuses:
 

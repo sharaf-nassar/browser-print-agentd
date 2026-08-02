@@ -51,6 +51,7 @@ UPDATER_LABEL="__UPDATER_LABEL__"
 UPDATER_PLIST="__UPDATER_PLIST_PATH__"
 SYSTEM_SUPPORT_DIR="__SYSTEM_SUPPORT_DIR__"
 UPDATE_STATE_DIR="__UPDATE_STATE_DIR__"
+UPDATE_STATUS_PATH="__UPDATE_STATUS_PATH__"
 SYSTEM_LOG_DIR="__SYSTEM_LOG_DIR__"
 INSTALL_MARKER="/var/run/__PRODUCT_NAME__-installing"
 SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
@@ -138,15 +139,20 @@ if ! /usr/bin/plutil -lint "$UPDATER_PLIST" >/dev/null; then
 	fail "$UPDATER_PLIST is not a valid property list"
 fi
 
-# Root-only updater state is machine-wide and never shares permissions with the
-# per-account cert or agent log directories below.
+# The support root is traversable so the unprivileged agent can read the one
+# sanitized status file placed directly beneath it. Sensitive updater state
+# remains inside the mode-700 child directory.
 for path in "$SYSTEM_SUPPORT_DIR" "$UPDATE_STATE_DIR" "$SYSTEM_LOG_DIR"; do
 	[ ! -L "$path" ] || fail "refusing symlinked updater directory: $path"
 done
 /bin/mkdir -p "$UPDATE_STATE_DIR" "$SYSTEM_LOG_DIR"
 /usr/sbin/chown root:wheel "$SYSTEM_SUPPORT_DIR" "$UPDATE_STATE_DIR" "$SYSTEM_LOG_DIR"
-/bin/chmod 700 "$SYSTEM_SUPPORT_DIR" "$UPDATE_STATE_DIR"
+/bin/chmod 755 "$SYSTEM_SUPPORT_DIR"
+/bin/chmod 700 "$UPDATE_STATE_DIR"
 /bin/chmod 755 "$SYSTEM_LOG_DIR"
+if [ -L "$UPDATE_STATUS_PATH" ]; then
+	/bin/rm -f "$UPDATE_STATUS_PATH"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Per-station cert pair
@@ -276,7 +282,7 @@ log "agent is serving on http://127.0.0.1:$HTTP_PORT"
 if /bin/launchctl print "system/$UPDATER_LABEL" >/dev/null 2>&1; then
 	log "updater $UPDATER_LABEL is already registered"
 elif /bin/launchctl print-disabled system 2>/dev/null |
-	/usr/bin/grep -Fq "\"$UPDATER_LABEL\" => true"; then
+	/usr/bin/grep -Fq "\"$UPDATER_LABEL\" => disabled"; then
 	log "updater $UPDATER_LABEL is pinned disabled; leaving it inactive"
 else
 	log "bootstrapping updater $UPDATER_LABEL in the system domain"

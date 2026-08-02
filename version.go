@@ -38,6 +38,7 @@ type healthReport struct {
 	OriginPosture string          `json:"originPosture"`
 	OriginAllow   []string        `json:"originAllow"`
 	Printers      []healthPrinter `json:"printers"`
+	Update        *updateReport   `json:"update,omitempty"`
 
 	// CUPSError is set when discovery itself failed. The report is still a 200
 	// in that case on purpose: "the agent is alive at version X and cannot see
@@ -67,11 +68,27 @@ func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), availableBudget)
 	defer cancel()
 
+	// Reading launchd pin state is independent of CUPS, so run it alongside the
+	// printer probes. A missing, malformed, unreadable, or unprovable updater
+	// state simply leaves the additive object absent.
+	var updateResult <-chan *updateReport
+	if a.updates != nil {
+		result := make(chan *updateReport, 1)
+		updateResult = result
+		go func() {
+			result <- a.updates.read(ctx)
+		}()
+	}
 	report := healthReport{
 		Version:       version,
 		OriginPosture: posturelogAndAllow,
 		OriginAllow:   append([]string{}, a.originAllow...),
 		Printers:      []healthPrinter{},
+	}
+	attachUpdate := func() {
+		if updateResult != nil {
+			report.Update = <-updateResult
+		}
 	}
 	if len(a.originAllow) > 0 {
 		report.OriginPosture = postureAllowlist
@@ -80,6 +97,7 @@ func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	printers, err := discoverPrinters(ctx, a.cups)
 	if err != nil {
 		report.CUPSError = err.Error()
+		attachUpdate()
 		sendJSON(w, http.StatusOK, report)
 		return
 	}
@@ -102,5 +120,6 @@ func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 			Healthy:    healthy[candidate.Queue],
 		})
 	}
+	attachUpdate()
 	sendJSON(w, http.StatusOK, report)
 }
