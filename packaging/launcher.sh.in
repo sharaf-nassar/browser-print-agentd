@@ -9,15 +9,13 @@
 #
 # It exists for one reason: launchd does not expand a home directory in
 # StandardOutPath/StandardErrorPath, and the agent's log is per-account by
-# design (plan Q6/Q9). So the log path is resolved here, at launch, in the
-# user's own session, instead of being baked into a machine-wide plist.
+# design (plan Q6/Q9). So the log path is resolved here and passed to the
+# daemon, which owns the descriptor and the bounded archive ring.
 #
-# Everything the agent writes to stdout and stderr — the per-job audit lines,
-# the origin lines, the listener banner — lands in the same file, appended
-# across restarts so a KeepAlive respawn does not truncate the trail. Failures
-# that happen BEFORE the agent starts (no home directory, unwritable log
-# directory) have nowhere to log, so they go to the unified log via `logger`
-# and are readable with:
+# Normal output never uses launchd descriptors: the daemon writes complete
+# lines through its rotating logger, and the Go runtime's crash output follows
+# the current active file. Failures before that logger exists go to the unified
+# log via `logger` and are readable with:
 #
 #   log show --last 1h --predicate 'eventMessage CONTAINS "__PRODUCT_NAME__"'
 #
@@ -51,15 +49,15 @@ if [ -z "$home" ] || [ ! -d "$home" ]; then
 	exit 78 # EX_CONFIG
 fi
 
-log_dir="$home/Library/Logs/__LOG_DIR_NAME__"
-if ! /bin/mkdir -p "$log_dir"; then
-	note "cannot create $log_dir; refusing to start"
-	exit 73 # EX_CANTCREAT
-fi
-
 if [ ! -x "$BINARY" ]; then
 	note "$BINARY is missing or not executable; refusing to start"
 	exit 69 # EX_UNAVAILABLE
 fi
 
-exec "$BINARY" "$@" >>"$log_dir/agent.log" 2>&1
+__LOG_PATH_ENV__="$home/Library/Logs/__LOG_DIR_NAME__/__LOG_FILE_NAME__"
+export __LOG_PATH_ENV__
+
+# The daemon owns normal logging and installs a crash-output descriptor on the
+# current active file. A stray stdout/stderr write must not create an unbounded
+# launchd file or keep a renamed inode growing.
+exec "$BINARY" "$@" >/dev/null 2>&1

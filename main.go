@@ -33,6 +33,17 @@ import (
 const shutdownGrace = 5 * time.Second
 
 func main() {
+	logger := newAgentLogger(os.Stdout)
+	if path := os.Getenv(logPathEnvVar); path != "" {
+		var err error
+		logger, err = newRotatingAgentLogger(path)
+		if err != nil {
+			reportFallback(fmt.Sprintf("cannot initialize agent log: %v", err))
+			os.Exit(1)
+		}
+		defer logger.close()
+	}
+
 	config, err := parseConfig(os.Args[1:], os.Getenv, os.Stderr)
 	if err != nil {
 		// `--help` prints usage through the flag set itself, so it exits clean
@@ -40,22 +51,21 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			os.Exit(0)
 		}
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		logger.write(fmt.Sprintf("error: %v", err))
 		os.Exit(2)
 	}
-	if err := run(config); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	if err := run(config, logger); err != nil {
+		logger.write(fmt.Sprintf("error: %v", err))
 		os.Exit(1)
 	}
 }
 
 // run starts the listeners and blocks until the process is asked to stop.
-func run(config config) error {
+func run(config config, logger *agentLogger) error {
 	if err := verifyCUPSBinaries(); err != nil {
 		return err
 	}
 
-	logger := newAgentLogger(os.Stdout)
 	handler := newAgent(osRunner{}, logger, config.OriginAllow)
 	if config.UpdateStatusPath != "" && config.UpdaterLabel != "" {
 		handler.updates = &updateReader{
@@ -65,11 +75,10 @@ func run(config config) error {
 	}
 
 	if len(config.OriginAllow) == 0 {
-		fmt.Fprintf(os.Stdout,
-			"origin posture: log-and-allow (no --origin-allow configured)\n")
+		logger.write("origin posture: log-and-allow (no --origin-allow configured)")
 	} else {
-		fmt.Fprintf(os.Stdout, "origin posture: /write restricted to %v\n",
-			config.OriginAllow)
+		logger.write(fmt.Sprintf("origin posture: /write restricted to %v",
+			config.OriginAllow))
 	}
 
 	servers := make([]*http.Server, 0, 2)
@@ -82,7 +91,7 @@ func run(config config) error {
 	}
 	servers = append(servers, plain)
 	go func() {
-		fmt.Fprintf(os.Stdout, "listening on http://%s\n", plain.Addr)
+		logger.write(fmt.Sprintf("listening on http://%s", plain.Addr))
 		errs <- plain.ListenAndServe()
 	}()
 
@@ -98,13 +107,13 @@ func run(config config) error {
 		}
 		servers = append(servers, secure)
 		go func() {
-			fmt.Fprintf(os.Stdout, "listening on https://%s\n", secure.Addr)
+			logger.write(fmt.Sprintf("listening on https://%s", secure.Addr))
 			errs <- secure.ListenAndServeTLS(certFile, keyFile)
 		}()
 	} else {
-		fmt.Fprintf(os.Stdout,
+		logger.write(fmt.Sprintf(
 			"no cert pair in %s - HTTPS listener skipped; Safari cannot reach the "+
-				"agent without it\n", config.CertDir)
+				"agent without it", config.CertDir))
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -125,6 +134,16 @@ func run(config config) error {
 		server.Shutdown(ctx)
 	}
 	return runErr
+}
+
+// reportFallback is used only when the daemon-owned log is unavailable. The
+// packaged launcher sends process stdout/stderr to /dev/null, so invoke the
+// macOS unified-log bridge explicitly as well as preserving direct-run stderr.
+func reportFallback(message string) {
+	if path, err := exec.LookPath("logger"); err == nil {
+		_ = exec.Command(path, "-t", productName, message).Run()
+	}
+	fmt.Fprintf(os.Stderr, "%s: %s\n", productName, message)
 }
 
 // verifyCUPSBinaries fails fast when the CUPS client tools are missing. This is

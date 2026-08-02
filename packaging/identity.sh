@@ -57,10 +57,12 @@ SYSTEM_LOG_DIR="/Library/Logs/${PRODUCT_NAME}"
 # against root.
 SUPPORT_DIR_NAME="${PRODUCT_NAME}"
 LOG_DIR_NAME="${PRODUCT_NAME}"
+LOG_FILE_NAME="agent.log"
 
 # Environment-variable namespace for the agent and the installer scripts.
 ENV_PREFIX="BROWSER_PRINT_AGENTD"
 TARGET_USER_ENV="${ENV_PREFIX}_TARGET_USER"
+LOG_PATH_ENV="${ENV_PREFIX}_LOG_PATH"
 
 # mktemp/log identity. TEMP_PREFIX is intentionally shorter than PRODUCT_NAME:
 # it is the shared prefix for every temp file the product creates, including the

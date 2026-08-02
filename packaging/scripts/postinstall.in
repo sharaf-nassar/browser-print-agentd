@@ -116,6 +116,10 @@ CERT_DIR="$TARGET_HOME/Library/Application Support/__SUPPORT_DIR_NAME__"
 CERT_FILE="$CERT_DIR/cert.pem"
 KEY_FILE="$CERT_DIR/key.pem"
 LOG_DIR="$TARGET_HOME/Library/Logs/__LOG_DIR_NAME__"
+LOG_FILE="$LOG_DIR/__LOG_FILE_NAME__"
+for path in "$CERT_DIR" "$LOG_DIR"; do
+	[ ! -L "$path" ] || fail "refusing symlinked per-account directory: $path"
+done
 
 # ---------------------------------------------------------------------------
 # Payload sanity
@@ -225,9 +229,17 @@ fi
 /bin/mkdir -p "$CERT_DIR" "$LOG_DIR"
 /usr/sbin/chown -R "$TARGET_UID:$TARGET_GID" "$CERT_DIR" "$LOG_DIR"
 /bin/chmod 700 "$CERT_DIR"
-/bin/chmod 755 "$LOG_DIR"
+/bin/chmod 700 "$LOG_DIR"
 /bin/chmod 600 "$KEY_FILE"
 /bin/chmod 644 "$CERT_FILE"
+# Existing ring members may come from an upgrade. Ownership is installed here;
+# the daemon validates type, size, ordering, and mode before its first write.
+for path in "$LOG_FILE" "$LOG_FILE".{1..7}; do
+	if [ -e "$path" ] && [ ! -L "$path" ]; then
+		/usr/sbin/chown "$TARGET_UID:$TARGET_GID" "$path"
+		/bin/chmod 600 "$path"
+	fi
+done
 
 # ---------------------------------------------------------------------------
 # 2. Trust the cert
@@ -267,8 +279,8 @@ until /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$HTTP_PORT/available" >/
 	attempt=$((attempt + 1))
 	if [ "$attempt" -ge "$PROBE_ATTEMPTS" ]; then
 		/bin/launchctl print "gui/$TARGET_UID/$LABEL" 2>&1 | /usr/bin/head -40 >&2 || true
-		/usr/bin/tail -20 "$LOG_DIR/agent.log" >&2 2>/dev/null || true
-		fail "the agent did not answer on port $HTTP_PORT after $PROBE_ATTEMPTS attempts. It is installed but not serving — see $LOG_DIR/agent.log and the launchctl state above. Printing WILL NOT work until this is resolved."
+		/usr/bin/tail -20 "$LOG_FILE" >&2 2>/dev/null || true
+		fail "the agent did not answer on port $HTTP_PORT after $PROBE_ATTEMPTS attempts. It is installed but not serving — see $LOG_FILE and the launchctl state above. Printing WILL NOT work until this is resolved."
 	fi
 	sleep 1
 done

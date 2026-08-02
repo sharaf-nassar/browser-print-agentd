@@ -236,8 +236,10 @@ render_template() {
 		-e "s|__SYSTEM_LOG_DIR__|$SYSTEM_LOG_DIR|g" \
 		-e "s|__SUPPORT_DIR_NAME__|$SUPPORT_DIR_NAME|g" \
 		-e "s|__LOG_DIR_NAME__|$LOG_DIR_NAME|g" \
+		-e "s|__LOG_FILE_NAME__|$LOG_FILE_NAME|g" \
 		-e "s|__ENV_PREFIX__|$ENV_PREFIX|g" \
 		-e "s|__TARGET_USER_ENV__|$TARGET_USER_ENV|g" \
+		-e "s|__LOG_PATH_ENV__|$LOG_PATH_ENV|g" \
 		-e "s|__TEMP_PREFIX__|$TEMP_PREFIX|g" \
 		-e "s|__RELEASE_OWNER__|$RELEASE_OWNER|g" \
 		-e "s|__RELEASE_REPOSITORY__|$RELEASE_REPOSITORY|g" \

@@ -22,8 +22,9 @@
 
   ProgramArguments points at a launcher rather than the binary because launchd
   cannot expand a home directory in StandardOutPath/StandardErrorPath: the
-  launcher resolves $HOME itself, creates the per-user log directory, and
-  redirects the agent's output there.
+  launcher resolves $HOME and passes the per-user log path to the daemon. The
+  daemon owns the active descriptor and rotates complete lines; launchd output
+  paths would keep writing a renamed inode and therefore are not configured.
 
   This plist is the per-station configuration surface (plan Q10): ports and bind
   address are edited here, never in code. To lock /write to the SPA origin, add

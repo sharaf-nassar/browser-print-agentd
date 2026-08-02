@@ -240,10 +240,9 @@ directory is private mode 0700 and the active file and archives are mode 0600, b
 device identifiers are useful audit data but should not be readable by unrelated local accounts.
 
 The mechanism is daemon-owned rotation, specified in
-[[packaging#Packaging#Station Installer#Request Log Ownership And Rotation]]. Beads issue
-`zebra-mac-agent-w1o` records the decision; `zebra-mac-agent-mau` implements it. Until that
-follow-up ships, the launcher still appends to one unbounded `agent.log`, so this policy is not
-claimed as an enforced property of the current package.
+[[packaging#Packaging#Station Installer#Request Log Ownership And Rotation]].
+`[[log.go#rotatingLog]]` owns the active descriptor, normalizes the ring on startup, and performs
+the close/rename/open sequence under `[[log.go#agentLogger#write]]`'s concurrency boundary.
 
 ## Version And Health Surface
 

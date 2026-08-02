@@ -14,7 +14,8 @@ the naming gate. It carries `PRODUCT_NAME`, `PRODUCT_TITLE`, `BUNDLE_ID` (used v
 the launchd `Label` and the `productbuild` package identifier), `BINARY_NAME`, `BINARY_PATH`,
 `UNINSTALLER_NAME`/`UNINSTALLER_PATH`, `LIBEXEC_DIR`, `LAUNCHER_PATH`, `PLIST_NAME`,
 `AGENT_PLIST_PATH`, updater script/label/plist paths, public update-status path, root updater support/log paths,
-`SUPPORT_DIR_NAME`, `LOG_DIR_NAME`, `ENV_PREFIX`, `TARGET_USER_ENV`, `TEMP_PREFIX`, the derived
+`SUPPORT_DIR_NAME`, `LOG_DIR_NAME`, `LOG_FILE_NAME`, `ENV_PREFIX`, `TARGET_USER_ENV`,
+`LOG_PATH_ENV`, `TEMP_PREFIX`, the derived
 GitHub release URL, `COMPONENT_PKG_NAME`, and the release-tag glob. Everything but the product
 name itself and the reverse-DNS namespace prefix is derived, so a rename is a one-line edit.
 
@@ -105,22 +106,21 @@ redesign.
 
 `ProgramArguments` points at `${LIBEXEC_DIR}/launcher` (rendered from `launcher.sh.in`) rather
 than straight at the binary, because launchd does not expand a home directory in
-`StandardOutPath`/`StandardErrorPath`. The launcher resolves `$HOME` inside the user's own
-session, creates the log directory, and appends the agent's stdout and stderr to `agent.log`;
-failures that happen before the agent starts have nowhere to log, so they go to the unified log
-through `logger`. The plist is also the per-station configuration surface — ports, bind address,
-and the optional origin allowlist are edited there and nowhere else, and no origin ships in the
-package.
+`StandardOutPath`/`StandardErrorPath`. The launcher resolves `$HOME`, exports the identity-derived
+log path, and sends otherwise-unused stdout/stderr to `/dev/null`; the daemon opens the path and
+owns all normal output. Failures before the daemon logger exists go to unified logging through
+`logger`. The plist is also the per-station configuration surface — ports, bind address, and the
+optional origin allowlist are edited there and nowhere else, and no origin ships in the package.
 
 ### Request Log Ownership And Rotation
 
 The agent must own its log descriptor and size rotation; neither `newsyslog` nor launchd output
 redirection can enforce [[tools#Print Agent#Origin Posture#Request And Job Log Retention]].
 
-The packaged launcher currently opens `agent.log` with shell append redirection and then `exec`s
-the agent. A macOS 26.6 station inspection confirmed both stdout and stderr remain open on that
-same per-user inode for the process lifetime. Renaming the path does not move those descriptors to
-a new file: writes continue into the renamed archive until the agent reopens or restarts.
+Before daemon ownership, the packaged launcher opened `agent.log` with shell append redirection
+and then `exec`ed the agent. A macOS 26.6 station inspection confirmed both stdout and stderr
+remained open on that same per-user inode for the process lifetime. Renaming the path did not move
+those descriptors to a new file: writes continued into the renamed archive until restart.
 
 `newsyslog` is rejected for this topology. Its installed manual and dry-run parser establish that
 configuration fields are whitespace-separated, with no quoting or escaping for a home path that
@@ -137,13 +137,18 @@ this product no explicit size or age bound and changes the admin's plain-file au
 second root timer that stops the agent, rotates, and restarts it merely recreates a less safe
 daemon-owned rotator with additional root/user ownership and in-flight-job failure modes.
 
-The implementation follow-up must move all post-launch output to one writer opened by the daemon
-in the resolved account home. Under the logger mutex it checks size before each complete line,
-closes the active descriptor, shifts the seven archives by atomic rename, opens a new private
-active file, and appends the pending line. Startup enforces the same ring before the first write,
-so crashes and KeepAlive restarts cannot bypass the bound. Pre-launch failures remain in unified
-logging because no daemon exists yet to own the file. This implementation is follow-up issue
-`zebra-mac-agent-mau`; the current launcher remains unbounded until it lands.
+All post-launch normal output uses one writer opened by the daemon in the resolved account home.
+Under the logger mutex it checks size before each complete line, closes the active descriptor,
+deletes only `.7`, shifts archives by atomic rename, opens a new private active file, and appends
+the pending line. Startup removes unsafe or oversize exact ring members and repairs private modes
+before the first intentional write, so KeepAlive restarts restore the bound.
+
+The Go runtime's crash descriptor is rebound whenever a new active file opens. Rebinding closes
+the previous duplicate, so continuous output cannot keep a renamed archive growing; a crash racing
+the brief close/rename/open sequence may finish on the old retained inode, and restart
+normalization restores the bound. Pre-launch and log-open failures use unified logging because no
+daemon-owned file is available. launchd stdout/stderr paths remain unset, and the launcher sends
+the daemon's otherwise-unused process descriptors to `/dev/null`.
 
 ### The launchd On-Demand Gate
 

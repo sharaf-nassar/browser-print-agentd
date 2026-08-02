@@ -409,8 +409,8 @@ that happens to be older.
 
    `GET /health` reports the running version, and every response also carries it as
    `X-Print-Agent-Version`. Copy the agent log before overwriting it —
-   `~/Library/Logs/browser-print-agentd/agent.log` — because the whole point of rolling back is
-   that someone still has to diagnose the bad build afterwards.
+   `~/Library/Logs/browser-print-agentd/` — because the whole point of rolling back is that
+   someone still has to diagnose the bad build afterwards.
 
 2. **Download the previous release's installer** from its own GitHub release. The asset name
    carries the version, so downgrading is picking a filename:
@@ -508,8 +508,8 @@ ls ~/Library/Logs/browser-print-agentd 2>/dev/null                         # gon
 sudo ls /Library/Application\ Support/browser-print-agentd 2>/dev/null     # gone
 ```
 
-Copy `~/Library/Logs/browser-print-agentd/agent.log` first if you are uninstalling because
-something was wrong — the uninstaller deletes it.
+Copy `~/Library/Logs/browser-print-agentd/` first if you are uninstalling because something was
+wrong — the uninstaller deletes the active log and every archive.
 
 Uninstalling is **not** part of the rollback path: reinstall the older `.pkg` directly. Nor is it
 part of upgrading; a newer `.pkg` installs straight over an older one. It **is** the first step of
@@ -768,16 +768,14 @@ curl -fsSk https://127.0.0.1:9101/available
 
 ### Agent log retention
 
-The adopted policy is one 8 MiB `agent.log` plus seven 8 MiB uncompressed archives, a 64 MiB
-per-account ceiling. Rotation keeps complete lines, so origin, device uid, byte count, and `lp`
-request id remain present until their archive is evicted. The log directory and files become
-private to the station account under that policy.
+The agent keeps one 8 MiB `agent.log` plus seven 8 MiB uncompressed archives, a 64 MiB per-account
+ceiling under normal bounded line size. Before a complete line would cross the limit, the daemon
+closes and archives the active file: `.1` is newest and `.7` oldest. Rotation never splits a line,
+so origin, device uid, byte count, and `lp` request id remain present until archive eviction. The
+directory is mode 0700 and every ring file is mode 0600, owned by the station account.
 
-That daemon-owned rotation is not in the current package yet: the current launcher still appends
-to one unbounded `agent.log`. Until the implementation ships, monitor that file's size and copy it
-off the station before local disk pressure becomes a concern. Do not add a `newsyslog` rule as a
-local workaround; the running process keeps stdout and stderr open on the renamed inode and can
-continue growing the archive instead of the replacement file.
+The daemon owns the active descriptor and rebinds Go crash output whenever it rotates. Do not add
+a `newsyslog` rule: it cannot improve the bound and would race the daemon's archive ordering.
 
 The uninstaller will continue to delete the whole log directory, including every archive. During
 an incident, copy the directory rather than only the active file before uninstalling.

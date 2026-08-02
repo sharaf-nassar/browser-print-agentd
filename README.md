@@ -107,7 +107,7 @@ Installed layout:
 | `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist`         | per-user LaunchAgent              |
 | `/Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist` | root updater LaunchDaemon         |
 | `~/Library/Application Support/browser-print-agentd/`                              | `cert.pem` and `key.pem`          |
-| `~/Library/Logs/browser-print-agentd/`                                             | per-user agent log                |
+| `~/Library/Logs/browser-print-agentd/`                                             | private, bounded per-user log ring |
 | `/Library/Application Support/browser-print-agentd/update-status`                  | sanitized updater diagnostics     |
 | `/Library/Application Support/browser-print-agentd/updater/`                       | updater cache and state           |
 | `/Library/Logs/browser-print-agentd/update.log`                                    | updater verification/install log |
@@ -139,7 +139,8 @@ installer receipt:
 sudo /usr/local/bin/browser-print-agentd-uninstall
 ```
 
-It deletes the log, so copy the log first if you are uninstalling because something was wrong.
+It deletes the log ring, so copy the directory first if you are uninstalling because something
+was wrong.
 
 **Configuration** is by flag, with an environment mirror for each:
 `--bind`, `--port`, `--https-port`, `--cert-dir`, `--origin-allow`, mirrored by

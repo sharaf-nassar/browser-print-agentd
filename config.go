@@ -48,6 +48,7 @@ var (
 var (
 	updateStatusEnvVar = envPrefix + "_UPDATE_STATUS_PATH"
 	updaterLabelEnvVar = envPrefix + "_UPDATER_LABEL"
+	logPathEnvVar      = envPrefix + "_LOG_PATH"
 )
 
 // config is the resolved runtime configuration. Ports and bind address are
