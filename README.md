@@ -85,21 +85,41 @@ Everything else is root work the package scripts do for you:
 - **`postinstall`** generates a per-station self-signed cert pair (CN/SAN `localhost`, EKU
   `serverAuth`) under `~/Library/Application Support/browser-print-agentd/`, trusts it in the
   **System** keychain, bootstraps the LaunchAgent into `gui/<uid>` so printing works without a
-  logout, and then polls `http://127.0.0.1:9100/available`. A failed probe **fails the install**.
+  logout, polls `http://127.0.0.1:9100/available`, then registers the separate root updater in the
+  system domain. A failed agent probe **fails the install**.
 
 Installed layout:
 
-| Path                                                                       | What                      |
-| -------------------------------------------------------------------------- | ------------------------- |
-| `/usr/local/bin/browser-print-agentd`                                      | the agent binary          |
-| `/usr/local/bin/browser-print-agentd-uninstall`                            | the uninstaller           |
-| `/usr/local/libexec/browser-print-agentd/launcher`                         | launchd entry point       |
-| `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist` | the LaunchAgent           |
-| `~/Library/Application Support/browser-print-agentd/`                      | `cert.pem` and `key.pem`  |
-| `~/Library/Logs/browser-print-agentd/`                                     | agent log                 |
+| Path                                                                               | What                              |
+| ---------------------------------------------------------------------------------- | --------------------------------- |
+| `/usr/local/bin/browser-print-agentd`                                              | the agent binary                  |
+| `/usr/local/bin/browser-print-agentd-uninstall`                                    | the uninstaller                   |
+| `/usr/local/libexec/browser-print-agentd/launcher`                                 | agent launchd entry point         |
+| `/usr/local/libexec/browser-print-agentd/updater`                                  | short-lived root updater          |
+| `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist`         | per-user LaunchAgent              |
+| `/Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist` | root updater LaunchDaemon         |
+| `~/Library/Application Support/browser-print-agentd/`                              | `cert.pem` and `key.pem`          |
+| `~/Library/Logs/browser-print-agentd/`                                             | per-user agent log                |
+| `/Library/Application Support/browser-print-agentd/updater/`                       | updater cache and state           |
+| `/Library/Logs/browser-print-agentd/update.log`                                    | updater verification/install log |
 
-**Uninstall** removes all of it — job, plist, binary, launcher, keychain trust (matched by SHA-1
-fingerprint, never by name), cert and log directories, and the installer receipt:
+The updater wakes at load and roughly daily, with per-run jitter, and exits after one check. It
+does nothing without a console user. A strict three-line manifest at GitHub's
+`releases/latest/download` feed is authoritative: any version difference triggers an install,
+including a downgrade when a bad latest release is yanked. Before replacement it caches and
+verifies the currently installed release package; an install or version-probe failure restores
+that package and quarantines the failed version from future attempts.
+
+Pin a managed or rolled-back station with one command; package upgrades preserve this disabled
+override:
+
+```bash
+sudo launchctl disable system/io.github.sharaf-nassar.browser-print-agentd.updater
+```
+
+**Uninstall** removes all of it — both jobs and plists, binary, launcher, updater state/cache,
+keychain trust (matched by SHA-1 fingerprint, never by name), cert and log directories, and the
+installer receipt:
 
 ```bash
 sudo /usr/local/bin/browser-print-agentd-uninstall

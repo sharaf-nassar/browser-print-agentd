@@ -7,7 +7,7 @@
 # target-user environment variable are all substituted at build time. Edit this
 # template, never the staged copy.
 #
-# Four jobs:
+# Five jobs:
 #
 #   1. Generate the per-station TLS cert pair (SAN=localhost, EKU serverAuth,
 #      well under Apple's 825-day trust ceiling) into the login account's
@@ -28,6 +28,8 @@
 #      install that "succeeded" while the agent is dead is precisely the phantom
 #      success this project exists to eliminate, so a failed probe fails the
 #      install.
+#   5. Register the separate root updater in the system domain without
+#      disturbing an already-running update or an administrator's disabled pin.
 #
 # Everything under a home directory is per-account by design: the agent is a
 # per-user LaunchAgent (plan Q6). Stations run one shared login, so that means
@@ -44,6 +46,13 @@ BINARY="__BINARY_PATH__"
 LAUNCHER="__LAUNCHER_PATH__"
 UNINSTALLER="__UNINSTALLER_PATH__"
 AGENT_PLIST="/Library/LaunchAgents/${LABEL}.plist"
+UPDATER="__UPDATER_PATH__"
+UPDATER_LABEL="__UPDATER_LABEL__"
+UPDATER_PLIST="__UPDATER_PLIST_PATH__"
+SYSTEM_SUPPORT_DIR="__SYSTEM_SUPPORT_DIR__"
+UPDATE_STATE_DIR="__UPDATE_STATE_DIR__"
+SYSTEM_LOG_DIR="__SYSTEM_LOG_DIR__"
+INSTALL_MARKER="/var/run/__PRODUCT_NAME__-installing"
 SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 
 HTTP_PORT=9100
@@ -111,19 +120,33 @@ LOG_DIR="$TARGET_HOME/Library/Logs/__LOG_DIR_NAME__"
 # Payload sanity
 # ---------------------------------------------------------------------------
 
-for path in "$BINARY" "$LAUNCHER"; do
+for path in "$BINARY" "$LAUNCHER" "$UPDATER"; do
 	[ -f "$path" ] || fail "$path is missing from the installed payload"
 	/bin/chmod 755 "$path"
 done
 [ -f "$AGENT_PLIST" ] || fail "$AGENT_PLIST is missing from the installed payload"
-/usr/sbin/chown root:wheel "$AGENT_PLIST"
-/bin/chmod 644 "$AGENT_PLIST"
+[ -f "$UPDATER_PLIST" ] || fail "$UPDATER_PLIST is missing from the installed payload"
+/usr/sbin/chown root:wheel "$AGENT_PLIST" "$UPDATER_PLIST"
+/bin/chmod 644 "$AGENT_PLIST" "$UPDATER_PLIST"
 if [ -f "$UNINSTALLER" ]; then
 	/bin/chmod 755 "$UNINSTALLER"
 fi
 if ! /usr/bin/plutil -lint "$AGENT_PLIST" >/dev/null; then
 	fail "$AGENT_PLIST is not a valid property list"
 fi
+if ! /usr/bin/plutil -lint "$UPDATER_PLIST" >/dev/null; then
+	fail "$UPDATER_PLIST is not a valid property list"
+fi
+
+# Root-only updater state is machine-wide and never shares permissions with the
+# per-account cert or agent log directories below.
+for path in "$SYSTEM_SUPPORT_DIR" "$UPDATE_STATE_DIR" "$SYSTEM_LOG_DIR"; do
+	[ ! -L "$path" ] || fail "refusing symlinked updater directory: $path"
+done
+/bin/mkdir -p "$UPDATE_STATE_DIR" "$SYSTEM_LOG_DIR"
+/usr/sbin/chown root:wheel "$SYSTEM_SUPPORT_DIR" "$UPDATE_STATE_DIR" "$SYSTEM_LOG_DIR"
+/bin/chmod 700 "$SYSTEM_SUPPORT_DIR" "$UPDATE_STATE_DIR"
+/bin/chmod 755 "$SYSTEM_LOG_DIR"
 
 # ---------------------------------------------------------------------------
 # 1. Per-station cert pair
@@ -245,6 +268,28 @@ until /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$HTTP_PORT/available" >/
 done
 
 log "agent is serving on http://127.0.0.1:$HTTP_PORT"
+
+# Register the root updater after printing is healthy. A running updater job is
+# left alone during install-over-install: booting it out here would kill the
+# process that invoked installer. The launchd disabled override is also left
+# untouched, so an administrator's system-domain pin survives every upgrade.
+if /bin/launchctl print "system/$UPDATER_LABEL" >/dev/null 2>&1; then
+	log "updater $UPDATER_LABEL is already registered"
+elif /bin/launchctl print-disabled system 2>/dev/null |
+	/usr/bin/grep -Fq "\"$UPDATER_LABEL\" => true"; then
+	log "updater $UPDATER_LABEL is pinned disabled; leaving it inactive"
+else
+	log "bootstrapping updater $UPDATER_LABEL in the system domain"
+	/usr/bin/touch "$INSTALL_MARKER"
+	/usr/sbin/chown root:wheel "$INSTALL_MARKER"
+	/bin/chmod 600 "$INSTALL_MARKER"
+	if ! /bin/launchctl bootstrap system "$UPDATER_PLIST"; then
+		/bin/rm -f "$INSTALL_MARKER"
+		fail "launchctl could not bootstrap $UPDATER_PLIST in the system domain"
+	fi
+	/bin/rm -f "$INSTALL_MARKER"
+fi
+
 log "verify by hand with: curl http://localhost:$HTTP_PORT/available"
 log "Safari path: curl https://localhost:9101/available"
 log "uninstall with: sudo $UNINSTALLER"

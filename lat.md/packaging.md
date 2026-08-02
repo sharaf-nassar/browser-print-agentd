@@ -13,9 +13,10 @@ The record is POSIX `sh` with no side effects, because it is sourced by both `bu
 the naming gate. It carries `PRODUCT_NAME`, `PRODUCT_TITLE`, `BUNDLE_ID` (used verbatim as both
 the launchd `Label` and the `productbuild` package identifier), `BINARY_NAME`, `BINARY_PATH`,
 `UNINSTALLER_NAME`/`UNINSTALLER_PATH`, `LIBEXEC_DIR`, `LAUNCHER_PATH`, `PLIST_NAME`,
-`AGENT_PLIST_PATH`, `SUPPORT_DIR_NAME`, `LOG_DIR_NAME`, `ENV_PREFIX`, `TARGET_USER_ENV`,
-`TEMP_PREFIX`, `COMPONENT_PKG_NAME`, and the release-tag glob. Everything but the product name
-itself and the reverse-DNS namespace prefix is derived, so a rename is a one-line edit.
+`AGENT_PLIST_PATH`, updater script/label/plist paths, root updater support/log paths,
+`SUPPORT_DIR_NAME`, `LOG_DIR_NAME`, `ENV_PREFIX`, `TARGET_USER_ENV`, `TEMP_PREFIX`, the derived
+GitHub release URL, `COMPONENT_PKG_NAME`, and the release-tag glob. Everything but the product
+name itself and the reverse-DNS namespace prefix is derived, so a rename is a one-line edit.
 
 The Go half cannot be templated — the binary is compiled, not rendered — so `productName` is
 restated once in `identity.go` and pinned to `identity.sh:BINARY_NAME` by the naming gate. That
@@ -49,13 +50,13 @@ Every shipped packaging artifact is a `.in` template that `packaging/build-pkg.s
 `sed` into its staging directory. No artifact is copied verbatim, and none is runnable straight
 from the repository.
 
-The template set is `launchagent.plist.in`, `distribution.xml.in`, `launcher.sh.in`,
-`uninstall.sh.in`, `scripts/preinstall.in`, and `scripts/postinstall.in`. Rendering fills the
-launchd `Label`, the `distribution.xml` `title`/`choice`/`pkg-ref` ids and component package
-name, the `preinstall`/`postinstall`/`uninstall` `LABEL` and installed paths, the per-account
-Application Support and Logs directory names, the log-tag prefixes, the target-user environment
-variable, and the `mktemp` prefixes. The generated LaunchAgent file is named `${BUNDLE_ID}.plist`
-rather than carrying a hardcoded filename.
+The template set is `launchagent.plist.in`, `updater.plist.in`, `distribution.xml.in`,
+`launcher.sh.in`, `updater.sh.in`, `uninstall.sh.in`, `scripts/preinstall.in`, and
+`scripts/postinstall.in`. Rendering fills both launchd labels and paths, the `distribution.xml`
+`title`/`choice`/`pkg-ref` ids and component package name, installer/uninstaller paths, account and
+root support/log directories, release URL, log-tag prefixes, target-user environment variable,
+and `mktemp` prefixes. Generated plist names derive from their labels rather than carrying
+hardcoded filenames.
 
 The architecture value `__HOST_ARCHITECTURES__` is substituted by the same pass; it is the one
 build-derived placeholder rather than an identity field.
@@ -137,6 +138,25 @@ automatically in ~3 s — inside `ThrottleInterval=10`, with no plist edit invol
 documented transient condition tied to a staged OS update, not a packaging defect, and keeping
 stations current on macOS is therefore an availability requirement. The plist comment carries the
 diagnosis so the next reader does not go hunting for a `KeepAlive` variant that does not exist.
+
+### Root Updater LaunchDaemon
+
+The updater is a separate, short-lived root LaunchDaemon; the print agent remains an unprivileged
+per-user LaunchAgent with no egress or update routes.
+
+`${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load and on a one-day
+`StartInterval`, with up to 15 minutes of script-level jitter. It has no `KeepAlive`. Every check
+therefore starts from the script currently on disk, and `postinstall` never boots out an already
+registered updater: a package replacement cannot kill the process that invoked `installer`.
+Bootstrap happens only after the print agent's own health probe, preserves launchd's disabled
+override, and uses an install marker plus the updater's `installer`-process check to prevent the
+RunAtLoad execution from nesting inside the package installation that registered it.
+
+The root state directory is mode 700 and holds the strict status file, failed-version quarantine,
+and verified rollback package. The root log directory is distinct from every account's agent log.
+Both paths, both updater artifacts, the release feed URL, and the updater label derive from
+`identity.sh`; uninstall boots the system job out and removes its plist, state, cache, script, and
+log along with the original payload.
 
 ### Preinstall And Postinstall
 

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Short-lived root updater for __PRODUCT_NAME__.
+
+  Rendered by build-pkg.sh from packaging/identity.sh and installed as
+  __UPDATER_PLIST_PATH__. This is deliberately separate from the per-user
+  LaunchAgent: only this process has network egress or installation privilege.
+
+  RunAtLoad covers a reboot and StartInterval checks roughly daily. Each run
+  adds up to 15 minutes of jitter before its network request. KeepAlive is
+  intentionally absent; a fresh process reads the currently installed script
+  on every run and cannot be killed by its own package replacement.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__UPDATER_LABEL__</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__UPDATER_PATH__</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StartInterval</key>
+	<integer>86400</integer>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>

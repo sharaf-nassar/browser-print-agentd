@@ -216,8 +216,8 @@ sha256=<64 lowercase hexadecimal characters>
 The workflow constructs expected checksum and manifest files independently and compares them
 byte-for-byte before upload. It also asserts all three asset names rather than trusting path
 construction. The package, checksum, and manifest are uploaded together, and the release is
-marked `--latest` explicitly so the future updater's `releases/latest/download/…` URL resolves to
-the feed that names that package.
+marked `--latest` explicitly so the updater's `releases/latest/download/…` URL resolves to the
+feed that names that package.
 
 Retention is only real if a run proves it, so the run that ships a build also names the build a
 station falls back to: after upload the previous `v*` release is read back and its installer and

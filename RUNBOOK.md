@@ -9,14 +9,15 @@ release chain. This document describes what you *do* with it. Read the wire cont
 have not; several diagnostics below only make sense against it.
 
 The agent ships only as a signed, notarized `.pkg` attached to a `vX.Y.Z` GitHub release. Nothing
-on a station is ever built from source, and no agent auto-updates itself: every version change on
-a station is an admin installing a specific `.pkg` on purpose. That is what makes the rollback
-below a one-step operation.
+on a station is ever built from source. A separate root LaunchDaemon keeps the package aligned to
+GitHub's latest-release manifest; the unprivileged print agent never updates itself and retains
+zero network egress. Manual rollback remains one package install after pinning the updater.
 
 ## Contents
 
 - [Releases and where the installers live](#releases-and-where-the-installers-live)
 - [Installing on a station](#installing-on-a-station)
+- [Managing automatic updates](#managing-automatic-updates)
 - [Migrating from another localhost print agent](#migrating-from-another-localhost-print-agent)
 - [Rolling back to the previous release](#rolling-back-to-the-previous-release)
 - [Uninstalling](#uninstalling)
@@ -125,7 +126,7 @@ target volume.
   Zebra Browser Print. Any *other* port holder, including a differently-named print agent, is a
   hard failure you resolve first.
 
-`postinstall` then does four things, in order:
+`postinstall` then does five things, in order:
 
 1. **Generates the station certificate** with `openssl` into
    `~/Library/Application Support/browser-print-agentd/` (`cert.pem` + `key.pem`, mode 600 on the
@@ -141,6 +142,26 @@ target volume.
 4. **Probes `http://127.0.0.1:9100/available` and fails the install if it does not answer** within
    ~15 s, dumping `launchctl print` state and the tail of the agent log. An install that reports
    success while the agent is dead is the exact phantom success this agent exists to kill.
+5. **Registers the updater LaunchDaemon** in the system domain after printing is healthy. A
+   running updater is never booted out during install-over-install, and a disabled updater stays
+   disabled, so package replacement cannot kill its own parent process or erase an admin pin.
+
+Machine-wide payload and updater state:
+
+| Path | Role |
+| ---- | ---- |
+| `/usr/local/bin/browser-print-agentd` | print agent binary |
+| `/usr/local/bin/browser-print-agentd-uninstall` | complete uninstaller |
+| `/usr/local/libexec/browser-print-agentd/launcher` | per-user agent entry point |
+| `/usr/local/libexec/browser-print-agentd/updater` | short-lived root updater |
+| `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist` | per-user print job |
+| `/Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist` | system update job |
+| `/Library/Application Support/browser-print-agentd/updater/` | verified rollback cache and state |
+| `/Library/Logs/browser-print-agentd/update.log` | updater log |
+
+The cert and agent log remain per-account under
+`~/Library/Application Support/browser-print-agentd/` and
+`~/Library/Logs/browser-print-agentd/`.
 
 ### 4. Confirm the station really prints
 
@@ -160,6 +181,72 @@ On Safari, also open `https://localhost:9101/available` once in a tab: a printer
 trust step took. A security warning instead means the certificate is served but not trusted — see
 [Safari and the certificate](#safari-and-the-certificate). Never ask an operator to click through
 that warning; re-running the installer is the supported repair.
+
+## Managing automatic updates
+
+The package ships a short-lived root updater. It runs at load and roughly daily, adds up to
+15 minutes of jitter, performs one check, and exits. It skips when no station account is logged in
+at the console because the package's own `postinstall` needs that account.
+
+The updater downloads the strict `update-manifest.txt` asset from the GitHub latest-release URL.
+The manifest names one version, package asset, and SHA-256 digest. Its version is compared with the
+installer receipt; **any difference installs**, not only a higher version. Marking a defective
+release prerelease or moving `latest` back therefore makes the next check restore the previous
+release fleet-wide.
+
+Before `installer` runs, the updater:
+
+- verifies the manifest grammar and exact asset name;
+- checks the package SHA-256;
+- validates its Developer ID Installer signature against the Team ID read at runtime from the
+  installed binary's code signature — the Team ID is never stored or logged;
+- writes `com.apple.quarantine` and requires `spctl --assess --type install` to report
+  `Notarized Developer ID`; and
+- downloads and verifies the currently installed release package as a rollback cache.
+
+After installation it polls `/health` until `X-Print-Agent-Version` matches the manifest. Failure
+reinstalls the cached package and records the failed version in `quarantined-versions`, so that
+same version is not retried on every daily run.
+
+### Pin or resume a station
+
+Pinning is one persistent launchd override. It survives package upgrades:
+
+```bash
+sudo launchctl disable system/io.github.sharaf-nassar.browser-print-agentd.updater
+```
+
+The updater is short-lived, so the command prevents future launches; an update already inside
+`installer` is allowed to finish or roll back. Resume with:
+
+```bash
+sudo launchctl enable system/io.github.sharaf-nassar.browser-print-agentd.updater
+```
+
+If `launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater` now says the
+service is not found, bootstrap its installed plist once:
+
+```bash
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist
+```
+
+Then request a check:
+
+```bash
+sudo launchctl kickstart system/io.github.sharaf-nassar.browser-print-agentd.updater
+```
+
+Updater state is root-owned:
+
+| Path | Meaning |
+| ---- | ------- |
+| `/Library/Logs/browser-print-agentd/update.log` | download, verification, install, and rollback trail |
+| `/Library/Application Support/browser-print-agentd/updater/last-run.txt` | latest status, timestamp, and relevant version |
+| `/Library/Application Support/browser-print-agentd/updater/quarantined-versions` | versions suppressed after failed installation |
+| `/Library/Application Support/browser-print-agentd/updater/good.pkg` | verified package for rollback |
+
+See [Updater troubleshooting](#updater-troubleshooting) before changing state by hand.
 
 ### Per-station configuration
 
@@ -302,9 +389,11 @@ lost `:9101`, or the agent is crash-looping. Reinstalling the previous release's
 service. There is no un-install step and no cleanup first: the older installer is a normal install
 that happens to be older.
 
-1. **Record what is running**, so the bad build is identifiable after it is gone:
+1. **Pin the updater, then record what is running**, so the bad build is identifiable after it is
+   gone and the latest feed cannot immediately reinstall it:
 
    ```bash
+   sudo launchctl disable system/io.github.sharaf-nassar.browser-print-agentd.updater
    curl -fsS http://127.0.0.1:9100/health
    pkgutil --pkg-info io.github.sharaf-nassar.browser-print-agentd
    ```
@@ -357,9 +446,11 @@ that happens to be older.
    accepted the job" is where the agent's honesty guarantee ends, so the physical label is what
    closes the loop.
 
-5. **Pin the station until the bad build is fixed.** Nothing auto-updates, so a rolled-back station
-   stays on the older version until an admin installs a newer `.pkg` by hand. File the defect
-   against the bad release before moving on.
+5. **Leave the station pinned until the bad build is fixed.** File the defect against the bad
+   release before moving on. Once the GitHub latest-release manifest names a good version, resume
+   the updater using [Pin or resume a station](#pin-or-resume-a-station). If maintainers yank the
+   bad latest release first, the updater performs this same downgrade automatically and no manual
+   rollback is needed.
 
 **Rolling back across a rename.** If the version you want to go back to shipped under a *different*
 product name, this is not a rollback — it is a migration in the other direction. Its `.pkg` will
@@ -379,9 +470,10 @@ reverse.
 ## Uninstalling
 
 `browser-print-agentd-uninstall` ships as `/usr/local/bin/browser-print-agentd-uninstall` and
-removes everything the install put on the machine: the LaunchAgent, the binary and launcher, the
-keychain trust and the station cert (matched by SHA-1 fingerprint, never by name), the cert and log
-directories, and the installer receipt — then confirms 9100 and 9101 came free.
+removes everything the install put on the machine: LaunchAgent, updater LaunchDaemon, binary,
+launcher, updater script/cache/state, keychain trust and station cert (matched by SHA-1
+fingerprint, never by name), agent/updater logs, and installer receipt — then confirms 9100 and
+9101 came free.
 
 ```bash
 sudo browser-print-agentd-uninstall          # add --user <account> on a multi-account station
@@ -399,10 +491,12 @@ Confirm the station is clean:
 
 ```bash
 launchctl print gui/$(id -u)/io.github.sharaf-nassar.browser-print-agentd  # "Could not find service"
+sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater  # same
 lsof -nP -iTCP:9100 -sTCP:LISTEN ; lsof -nP -iTCP:9101 -sTCP:LISTEN        # expect no output
 pkgutil --pkg-info io.github.sharaf-nassar.browser-print-agentd            # expect "No receipt"
 security find-certificate -c localhost -a /Library/Keychains/System.keychain  # ours is gone
 ls ~/Library/Logs/browser-print-agentd 2>/dev/null                         # gone unless you kept a copy
+sudo ls /Library/Application\ Support/browser-print-agentd 2>/dev/null     # gone
 ```
 
 Copy `~/Library/Logs/browser-print-agentd/agent.log` first if you are uninstalling because
@@ -441,6 +535,44 @@ answers 200 even when CUPS itself is unreachable. The same version rides every r
 
 If the agent answers but you are not sure it is *this* agent, see
 [Telling two agents apart](#telling-two-agents-apart).
+
+### Updater troubleshooting
+
+The updater and agent are separate jobs. An updater failure does not add an HTTP route, change
+the frozen wire contract, or give the agent egress. Inspect root-owned updater state directly:
+
+```bash
+sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | head -30
+sudo launchctl print-disabled system | grep io.github.sharaf-nassar.browser-print-agentd.updater
+sudo tail -100 /Library/Logs/browser-print-agentd/update.log
+sudo cat /Library/Application\ Support/browser-print-agentd/updater/last-run.txt
+```
+
+Common statuses:
+
+| Status | Meaning and action |
+| ------ | ------------------ |
+| `skipped-no-user` | Nobody was logged in at the console. No fault; next scheduled run checks again. |
+| `current` / `updated` | Receipt already matched, or install and version probe succeeded. |
+| `manifest-fetch-failed` / `package-fetch-failed` | Network or GitHub unavailable. The installed agent is untouched; retry later. |
+| `manifest-invalid` / `checksum-failed` / `trust-failed` | Release input failed closed before install. Do not bypass it; inspect the release assets. |
+| `rollback-cache-failed` | Current version's retained package could not be independently downloaded and verified, so replacement was refused. |
+| `rolled-back` | New install or version probe failed; verified previous package was restored and failed version quarantined. |
+| `rollback-failed` | Both update and recovery failed. Keep station pinned and perform the manual rollback procedure immediately. |
+| `quarantined` | Latest still names a version that already failed installation; updater will not retry it. |
+
+`quarantined-versions` is normally self-resolving because the next good release has a new version.
+If maintainers intentionally replace the asset under the **same** version, verify the repaired
+release first, clear the suppression, then request one check:
+
+```bash
+sudo rm -f /Library/Application\ Support/browser-print-agentd/updater/quarantined-versions
+sudo launchctl kickstart system/io.github.sharaf-nassar.browser-print-agentd.updater
+```
+
+Never delete `good.pkg` during an incident; it is the verified rollback package. Never work around
+`checksum-failed` or `trust-failed` with `xattr -d`, an alternate installer flag, or a hand-edited
+manifest.
 
 ### Agent not answering
 

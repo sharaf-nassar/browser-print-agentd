@@ -21,12 +21,11 @@ then install the pending macOS update and reboot, because
 [[packaging#Packaging#Station Installer#The launchd On-Demand Gate|no plist change clears it]].
 
 Three things are deliberately out of scope. There is no build-from-source or side-load path,
-because the agent ships only as a signed, notarized `.pkg` attached to a `vX.Y.Z` release and
-nothing on a station auto-updates today — every version change is an admin installing a specific
-package on purpose, which is what makes the rollback below one command;
-[[operations#Station Operations#Auto-Update Decision]] records the adopted successor to that
-shipping posture. Nothing CI already proves is
-repeated as an operator step. And no individual station's evidence trail is kept here.
+because the agent ships only as a signed, notarized `.pkg` attached to a `vX.Y.Z` release and the
+separate updater accepts only that release chain. The agent never updates itself; automatic
+package replacement belongs to
+[[operations#Station Operations#Auto-Update Decision]]. Nothing CI already proves is repeated as
+an operator step. And no individual station's evidence trail is kept here.
 
 ## Migrating From A Predecessor Agent
 
@@ -81,28 +80,26 @@ checklist below. Whether that hardware half has been run yet is a status that ch
 design fact, so the runbook's rollback note is its single home and this section does not restate
 it — consistent with
 [[operations#Station Operations#Station Validation Checklist#The Checklist Is Not A Run Log|the graph carrying no run results]],
-running item 11 updates that one note and nothing here. Nothing auto-updates in the shipping
-build — [[operations#Station Operations#Auto-Update Decision|the adopted updater]] is not yet
-implemented — so a rolled-back station stays put until an admin installs a newer package by
-hand, and the last step is to pin it and file the defect against the bad release.
+running item 11 updates that one note and nothing here. A manually rolled-back station is pinned
+first, then stays put until an admin resumes the updater. When maintainers move the latest
+manifest back instead, the updater performs the same downgrade automatically. In both cases the
+no-downgrade-guard package path remains the mechanism.
 Rolling back to a version that shipped under a *different* product name is not a rollback at all
 but a migration in the other direction, and it meets the same port-freedom hard failure.
 
 ## Auto-Update Decision
 
-Auto-update is adopted but not yet implemented: a separate root updater will keep stations
-current while the agent itself never updates itself. Until the updater ships, the manual-install
-posture above stays true of every station.
+Auto-update ships as a separate root updater that keeps stations current while the agent itself
+never updates itself.
 
 The decision (beads issue `zebra-mac-agent-egp`) splits the product in two. The agent stays
 exactly as it is — an unprivileged LaunchAgent, loopback-only, zero outbound network, no update
 routes — and updating becomes the job of a separate root daemon. The frozen wire contract, the
 `Device` shape, and the no-downgrade-guard install-over-install path of
 [[operations#Station Operations#Rollback Path]] are all untouched, and pinning a station stays one
-command: `sudo launchctl disable system/<updater-label>`. Implementation is phased and tracked in
-beads — phase 1, the release-side manifest and checksum assets, is shipped; phase 2 is the updater
-daemon plus the runbook updates; phase 3 is the `/health` update visibility. `RUNBOOK.md` changes
-only when the updater ships, because it describes shipping behavior alone.
+command: `sudo launchctl disable system/<updater-label>`. Phase 1, release-side manifest and
+checksum assets, and phase 2, updater daemon plus runbook, are shipped. Phase 3 may add `/health`
+update visibility without changing the frozen device or request shapes.
 
 ### The Adopted Updater Shape
 
@@ -114,7 +111,7 @@ The updater is a POSIX shell script shipped as a `packaging/*.in` template rende
 `packaging/identity.sh` — the same convention as `launcher.sh.in`
 ([[packaging#Packaging#Packaging Identity#Rendered Packaging Templates]]) — installed under
 `libexec/` and run by its own root LaunchDaemon label in the system domain with `RunAtLoad` plus
-a `StartInterval` of roughly a day with jitter. Short-lived runs mean each execution is a fresh
+a one-day `StartInterval` and up to 15 minutes of per-run jitter. Short-lived runs mean each
 exec of whatever is on disk, so the classic self-update race — a postinstall booting out the
 process that spawned `installer` — cannot occur, and
 [[packaging#Packaging#Station Installer#The launchd On-Demand Gate]] does not apply to it, being
@@ -143,8 +140,11 @@ never weakens the Gatekeeper contract.
 Install is `installer -pkg … -target /` with the rendered target-user environment variable set to
 the console user. Afterwards the updater probes `GET /health` until `X-Print-Agent-Version`
 matches the manifest ([[tools#Print Agent#Version And Health Surface]]); on failure it reinstalls
-the cached previous `.pkg`, kept from the last good update, and quarantines the failed version in
-a state file so it is never retried. It logs to `/Library/Logs/<product>/update.log`.
+the cached previous `.pkg` and quarantines the failed version in a state file so it is never
+retried. Before the first replacement, that cache is populated from the installed version's
+retained release assets and put through the same digest, signature, Team ID, quarantine, and
+notarization gates. A successful update replaces the cache with the now-proven current package.
+It logs to `/Library/Logs/<product>/update.log`.
 
 Observability keeps the agent at zero egress: the updater writes a status file, and `/health` —
 an additive diagnostics surface, not part of the frozen wire contract — may later expose update

@@ -1,0 +1,412 @@
+#!/bin/sh
+#
+# updater — short-lived, root-only release installer.
+#
+# Rendered from packaging/identity.sh and invoked only by the system-domain
+# LaunchDaemon. The print agent remains an unprivileged, loopback-only process
+# with no network or update routes. This script owns the product's sole egress
+# path and therefore treats every downloaded byte as untrusted.
+
+set -eu
+
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+LC_ALL=C
+export LC_ALL
+umask 077
+
+PRODUCT="__PRODUCT_NAME__"
+PKG_ID="__BUNDLE_ID__"
+BINARY="__BINARY_PATH__"
+STATE_ROOT="__SYSTEM_SUPPORT_DIR__"
+STATE_DIR="__UPDATE_STATE_DIR__"
+LOG_DIR="__SYSTEM_LOG_DIR__"
+LOG_FILE="$LOG_DIR/update.log"
+RELEASES_URL="__RELEASE_BASE_URL__"
+MANIFEST_URL="$RELEASES_URL/latest/download/update-manifest.txt"
+
+BAD_VERSIONS="$STATE_DIR/quarantined-versions"
+STATUS_FILE="$STATE_DIR/last-run.txt"
+CACHE_PKG="$STATE_DIR/good.pkg"
+CACHE_VERSION="$STATE_DIR/good.version"
+CACHE_SHA256="$STATE_DIR/good.sha256"
+INSTALL_MARKER="/var/run/__PRODUCT_NAME__-installing"
+
+CURL=/usr/bin/curl
+CODESIGN=/usr/bin/codesign
+PKGUTIL=/usr/sbin/pkgutil
+SPCTL=/usr/sbin/spctl
+INSTALLER=/usr/sbin/installer
+SHASUM=/usr/bin/shasum
+XATTR=/usr/bin/xattr
+PLUTIL=/usr/bin/plutil
+
+early_fail() {
+	/usr/bin/logger -t "$PRODUCT-updater" "$1" 2>/dev/null || true
+	printf '[%s updater] ERROR: %s\n' "$PRODUCT" "$1" >&2
+	exit 1
+}
+
+[ "$(/usr/bin/id -u)" -eq 0 ] || early_fail "must run as root"
+
+# Refuse symlinked roots before opening the log or state. The package creates
+# both directories as root, but this also makes a hand-created hostile path
+# fail closed on a machine where the product has never been installed.
+for path in "$STATE_ROOT" "$STATE_DIR" "$LOG_DIR"; do
+	[ ! -L "$path" ] || early_fail "refusing symlinked updater directory: $path"
+done
+/bin/mkdir -p "$STATE_DIR" "$LOG_DIR"
+/usr/sbin/chown root:wheel "$STATE_ROOT" "$STATE_DIR" "$LOG_DIR"
+/bin/chmod 700 "$STATE_ROOT" "$STATE_DIR"
+/bin/chmod 755 "$LOG_DIR"
+if [ -L "$LOG_FILE" ]; then
+	/bin/rm -f "$LOG_FILE"
+fi
+/usr/bin/touch "$LOG_FILE"
+/usr/sbin/chown root:wheel "$LOG_FILE"
+/bin/chmod 600 "$LOG_FILE"
+exec >>"$LOG_FILE" 2>&1
+
+log() { printf '[%s updater] %s\n' "$PRODUCT" "$*"; }
+fail() {
+	log "ERROR: $*"
+	exit 1
+}
+
+valid_version() {
+	printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+valid_sha256() {
+	printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+}
+
+write_status() {
+	status="$1"
+	status_version="$2"
+	tmp="$(/usr/bin/mktemp "$STATE_DIR/.last-run.XXXXXX")" || return 1
+	{
+		printf 'timestamp=%s\n' "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
+		printf 'status=%s\n' "$status"
+		printf 'version=%s\n' "$status_version"
+	} >"$tmp"
+	/bin/chmod 600 "$tmp"
+	/bin/mv -f "$tmp" "$STATUS_FILE"
+}
+
+resolve_console_user() {
+	console_user="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+	case "$console_user" in
+	"" | root | loginwindow | _*) return 1 ;;
+	esac
+	/usr/bin/id -u "$console_user" >/dev/null 2>&1 || return 1
+	printf '%s' "$console_user"
+}
+
+fetch_small() {
+	url="$1"
+	dest="$2"
+	"$CURL" --fail --location --silent --show-error \
+		--connect-timeout 20 --max-time 120 --retry 2 \
+		--max-filesize 1024 --proto '=https' --proto-redir '=https' \
+		--output "$dest" "$url"
+}
+
+fetch_pkg() {
+	url="$1"
+	dest="$2"
+	"$CURL" --fail --location --silent --show-error \
+		--connect-timeout 20 --max-time 900 --retry 2 \
+		--max-filesize 1073741824 --proto '=https' --proto-redir '=https' \
+		--output "$dest" "$url"
+}
+
+contains_nul_or_cr() {
+	file="$1"
+	/usr/bin/od -An -tx1 "$file" | /usr/bin/grep -Eq '(^|[[:space:]])(00|0d)([[:space:]]|$)'
+}
+
+parse_manifest() {
+	file="$1"
+	[ "$(/usr/bin/wc -c <"$file" | /usr/bin/tr -d ' ')" -le 512 ] || return 1
+	[ "$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')" -eq 3 ] || return 1
+	contains_nul_or_cr "$file" && return 1
+
+	manifest_version="$(/usr/bin/sed -n '1s/^version=//p' "$file")"
+	manifest_asset="$(/usr/bin/sed -n '2s/^asset=//p' "$file")"
+	manifest_sha256="$(/usr/bin/sed -n '3s/^sha256=//p' "$file")"
+
+	valid_version "$manifest_version" || return 1
+	[ "$manifest_asset" = "$PRODUCT-$manifest_version.pkg" ] || return 1
+	valid_sha256 "$manifest_sha256" || return 1
+	[ "$(/usr/bin/sed -n '1p' "$file")" = "version=$manifest_version" ] || return 1
+	[ "$(/usr/bin/sed -n '2p' "$file")" = "asset=$manifest_asset" ] || return 1
+	[ "$(/usr/bin/sed -n '3p' "$file")" = "sha256=$manifest_sha256" ] || return 1
+}
+
+read_installed_version() {
+	receipt_file="$1"
+	"$PKGUTIL" --pkg-info-plist "$PKG_ID" >"$receipt_file" 2>/dev/null || return 1
+	installed_version="$("$PLUTIL" -extract pkg-version raw -o - "$receipt_file" 2>/dev/null || true)"
+	valid_version "$installed_version"
+}
+
+read_team_id() {
+	info_file="$1"
+	"$CODESIGN" --verify --strict "$BINARY" >/dev/null 2>&1 || return 1
+	"$CODESIGN" --display --verbose=4 "$BINARY" >"$info_file" 2>&1 || return 1
+	team_id="$(/usr/bin/awk -F= '
+		/^TeamIdentifier=/ { count++; value=$2 }
+		END { if (count == 1) print value }
+	' "$info_file")"
+	printf '%s\n' "$team_id" | /usr/bin/grep -Eq '^[A-Z0-9]{10}$'
+}
+
+verify_sha256() {
+	pkg="$1"
+	expected="$2"
+	actual="$("$SHASUM" -a 256 "$pkg" | /usr/bin/awk '{print $1}')" || return 1
+	valid_sha256 "$actual" || return 1
+	[ "$actual" = "$expected" ]
+}
+
+verify_package() {
+	pkg="$1"
+	expected_team="$2"
+	sig_file="$3"
+	assess_file="$4"
+
+	"$PKGUTIL" --check-signature "$pkg" >"$sig_file" 2>&1 || return 1
+	/usr/bin/grep -Fq 'Signed with a trusted timestamp' "$sig_file" || return 1
+	pkg_team="$(/usr/bin/sed -n \
+		's/^[[:space:]]*1\. Developer ID Installer:.*(\([A-Z0-9][A-Z0-9]*\))[[:space:]]*$/\1/p' \
+		"$sig_file")"
+	[ "$pkg_team" = "$expected_team" ] || return 1
+
+	# Match the release pipeline's downloaded-file assessment exactly. Do not
+	# remove quarantine before installation; installer must receive the package
+	# that Gatekeeper accepted.
+	"$XATTR" -w com.apple.quarantine \
+		'0081;00000000;__UPDATER_NAME__;00000000-0000-0000-0000-000000000000' \
+		"$pkg" || return 1
+	"$SPCTL" --assess --verbose=2 --type install "$pkg" >"$assess_file" 2>&1 || return 1
+	/usr/bin/grep -Fq 'source=Notarized Developer ID' "$assess_file"
+}
+
+parse_checksum() {
+	file="$1"
+	asset="$2"
+	[ "$(/usr/bin/wc -c <"$file" | /usr/bin/tr -d ' ')" -le 256 ] || return 1
+	[ "$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')" -eq 1 ] || return 1
+	contains_nul_or_cr "$file" && return 1
+	checksum_sha256="$(/usr/bin/awk '{ if (NF == 2) print $1 }' "$file")"
+	valid_sha256 "$checksum_sha256" || return 1
+	[ "$(/usr/bin/sed -n '1p' "$file")" = "$checksum_sha256  $asset" ]
+}
+
+cache_is_good() {
+	expected_version="$1"
+	expected_team="$2"
+	cache_version="$(/usr/bin/sed -n '1p' "$CACHE_VERSION" 2>/dev/null || true)"
+	cache_sha="$(/usr/bin/sed -n '1p' "$CACHE_SHA256" 2>/dev/null || true)"
+	[ "$cache_version" = "$expected_version" ] || return 1
+	valid_sha256 "$cache_sha" || return 1
+	[ -f "$CACHE_PKG" ] || return 1
+	verify_sha256 "$CACHE_PKG" "$cache_sha" || return 1
+	verify_package "$CACHE_PKG" "$expected_team" "$TMP_DIR/cache-signature" \
+		"$TMP_DIR/cache-assessment"
+}
+
+store_good_package() {
+	pkg="$1"
+	version="$2"
+	sha="$3"
+	pkg_tmp="$(/usr/bin/mktemp "$STATE_DIR/.good.pkg.XXXXXX")"
+	version_tmp="$(/usr/bin/mktemp "$STATE_DIR/.good.version.XXXXXX")"
+	sha_tmp="$(/usr/bin/mktemp "$STATE_DIR/.good.sha256.XXXXXX")"
+	/bin/cp -f "$pkg" "$pkg_tmp"
+	printf '%s\n' "$version" >"$version_tmp"
+	printf '%s\n' "$sha" >"$sha_tmp"
+	/bin/chmod 600 "$pkg_tmp" "$version_tmp" "$sha_tmp"
+	/bin/mv -f "$pkg_tmp" "$CACHE_PKG"
+	/bin/mv -f "$version_tmp" "$CACHE_VERSION"
+	/bin/mv -f "$sha_tmp" "$CACHE_SHA256"
+}
+
+ensure_rollback_cache() {
+	current_version="$1"
+	expected_team="$2"
+	cache_is_good "$current_version" "$expected_team" && return 0
+
+	current_asset="$PRODUCT-$current_version.pkg"
+	current_base="$RELEASES_URL/download/v$current_version"
+	log "caching verified rollback package for $current_version"
+	fetch_small "$current_base/$current_asset.sha256" "$TMP_DIR/current.sha256" || return 1
+	parse_checksum "$TMP_DIR/current.sha256" "$current_asset" || return 1
+	fetch_pkg "$current_base/$current_asset" "$TMP_DIR/current.pkg" || return 1
+	verify_sha256 "$TMP_DIR/current.pkg" "$checksum_sha256" || return 1
+	verify_package "$TMP_DIR/current.pkg" "$expected_team" \
+		"$TMP_DIR/current-signature" "$TMP_DIR/current-assessment" || return 1
+	store_good_package "$TMP_DIR/current.pkg" "$current_version" "$checksum_sha256"
+}
+
+version_is_quarantined() {
+	version="$1"
+	[ -f "$BAD_VERSIONS" ] || return 1
+	/usr/bin/grep -Fqx "$version" "$BAD_VERSIONS"
+}
+
+quarantine_version() {
+	version="$1"
+	version_is_quarantined "$version" && return 0
+	tmp="$(/usr/bin/mktemp "$STATE_DIR/.quarantined.XXXXXX")"
+	if [ -f "$BAD_VERSIONS" ]; then
+		/bin/cp -f "$BAD_VERSIONS" "$tmp"
+	fi
+	printf '%s\n' "$version" >>"$tmp"
+	/bin/chmod 600 "$tmp"
+	/bin/mv -f "$tmp" "$BAD_VERSIONS"
+}
+
+probe_version() {
+	expected="$1"
+	attempt=0
+	while [ "$attempt" -lt 30 ]; do
+		if "$CURL" --fail --silent --show-error --max-time 2 \
+			--dump-header "$TMP_DIR/health.headers" --output /dev/null \
+			'http://127.0.0.1:9100/health' 2>/dev/null; then
+			header_version="$(/usr/bin/awk '
+				tolower($1) == "x-print-agent-version:" {
+					gsub(/\r/, "", $2); count++; value=$2
+				}
+				END { if (count == 1) print value }
+			' "$TMP_DIR/health.headers")"
+			[ "$header_version" = "$expected" ] && return 0
+		fi
+		attempt=$((attempt + 1))
+		/bin/sleep 1
+	done
+	return 1
+}
+
+install_package() {
+	pkg="$1"
+	__TARGET_USER_ENV__="$CONSOLE_USER" "$INSTALLER" -pkg "$pkg" -target /
+}
+
+rollback_failed_update() {
+	failed_version="$1"
+	old_version="$2"
+	log "update to $failed_version failed; reinstalling cached $old_version"
+	if ! cache_is_good "$old_version" "$TEAM_ID"; then
+		log "ERROR: cached rollback package no longer verifies"
+		return 1
+	fi
+	if ! install_package "$CACHE_PKG"; then
+		log "ERROR: installer could not restore cached $old_version"
+		return 1
+	fi
+	if ! probe_version "$old_version"; then
+		log "ERROR: cached $old_version installed but its health version did not appear"
+		return 1
+	fi
+	log "rollback to $old_version succeeded"
+}
+
+if [ -e "$INSTALL_MARKER" ]; then
+	log "another product install is in progress; skipping"
+	write_status skipped-install ""
+	exit 0
+fi
+if /usr/bin/pgrep -x installer >/dev/null 2>&1; then
+	log "macOS Installer is active; skipping"
+	write_status skipped-install ""
+	exit 0
+fi
+CONSOLE_USER="$(resolve_console_user || true)"
+if [ -z "$CONSOLE_USER" ]; then
+	log "no console user; skipping"
+	write_status skipped-no-user ""
+	exit 0
+fi
+
+# Spread requests from stations installed at the same time without keeping a
+# persistent daemon. The upper bound is short relative to the daily interval.
+jitter_seed="$(printf '%s:%s:%s\n' "$(/bin/date +%s)" "$$" "$(/bin/hostname)" |
+	/usr/bin/cksum | /usr/bin/awk '{print $1}')"
+jitter=$((jitter_seed % 901))
+log "scheduled check; delaying $jitter seconds for jitter"
+/bin/sleep "$jitter"
+
+TMP_DIR="$(/usr/bin/mktemp -d "${TMPDIR:-/private/tmp}/__TEMP_PREFIX__-update.XXXXXX")"
+trap '/bin/rm -rf "$TMP_DIR"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! read_installed_version "$TMP_DIR/receipt.plist"; then
+	fail "cannot read a strict X.Y.Z version from receipt $PKG_ID"
+fi
+INSTALLED_VERSION="$installed_version"
+if ! read_team_id "$TMP_DIR/codesign-info"; then
+	fail "installed binary has no valid Developer ID Team identifier"
+fi
+TEAM_ID="$team_id"
+
+log "fetching latest release manifest"
+if ! fetch_small "$MANIFEST_URL" "$TMP_DIR/update-manifest.txt"; then
+	write_status manifest-fetch-failed "$INSTALLED_VERSION"
+	fail "could not fetch update-manifest.txt"
+fi
+if ! parse_manifest "$TMP_DIR/update-manifest.txt"; then
+	write_status manifest-invalid "$INSTALLED_VERSION"
+	fail "update-manifest.txt failed strict validation"
+fi
+
+if [ "$manifest_version" = "$INSTALLED_VERSION" ]; then
+	log "version $INSTALLED_VERSION is current"
+	write_status current "$INSTALLED_VERSION"
+	exit 0
+fi
+if version_is_quarantined "$manifest_version"; then
+	log "version $manifest_version previously failed and is quarantined; skipping"
+	write_status quarantined "$manifest_version"
+	exit 0
+fi
+
+# Never replace a working build until its independently published package has
+# been downloaded and verified as a rollback target.
+if ! ensure_rollback_cache "$INSTALLED_VERSION" "$TEAM_ID"; then
+	write_status rollback-cache-failed "$INSTALLED_VERSION"
+	fail "could not establish a verified rollback package for $INSTALLED_VERSION"
+fi
+
+log "downloading manifest-selected package $manifest_asset"
+if ! fetch_pkg "$RELEASES_URL/latest/download/$manifest_asset" "$TMP_DIR/update.pkg"; then
+	write_status package-fetch-failed "$manifest_version"
+	fail "could not fetch $manifest_asset"
+fi
+if ! verify_sha256 "$TMP_DIR/update.pkg" "$manifest_sha256"; then
+	write_status checksum-failed "$manifest_version"
+	fail "downloaded package failed SHA-256 verification"
+fi
+if ! verify_package "$TMP_DIR/update.pkg" "$TEAM_ID" \
+	"$TMP_DIR/update-signature" "$TMP_DIR/update-assessment"; then
+	write_status trust-failed "$manifest_version"
+	fail "downloaded package failed signature, Team ID, or notarization verification"
+fi
+
+log "installing manifest version $manifest_version over $INSTALLED_VERSION"
+if install_package "$TMP_DIR/update.pkg" && probe_version "$manifest_version"; then
+	store_good_package "$TMP_DIR/update.pkg" "$manifest_version" "$manifest_sha256"
+	log "update to $manifest_version succeeded"
+	write_status updated "$manifest_version"
+	exit 0
+fi
+
+quarantine_version "$manifest_version"
+write_status install-failed "$manifest_version"
+if rollback_failed_update "$manifest_version" "$INSTALLED_VERSION"; then
+	write_status rolled-back "$manifest_version"
+	exit 1
+fi
+write_status rollback-failed "$manifest_version"
+fail "update to $manifest_version failed and rollback to $INSTALLED_VERSION failed"

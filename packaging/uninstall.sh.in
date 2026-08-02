@@ -8,12 +8,12 @@
 # straight from the repo — run the installed copy, or render it with
 # `STAGE_ONLY=1 packaging/build-pkg.sh`. "Completely" is the requirement (spec
 # S5):
-# the LaunchAgent is stopped and unregistered, the binary and launcher are
-# deleted, the station cert is UNTRUSTED and removed from the System keychain,
-# the cert and log directories are deleted, the installer receipt is forgotten,
-# and ports 9100/9101 are confirmed free at the end. Nothing is left behind that
-# could resurrect the agent at the next login or keep a stale trusted cert in
-# the keychain.
+# both launchd jobs are stopped and unregistered, the binary, launcher, updater,
+# root state/cache, and plists are deleted, the station cert is UNTRUSTED and
+# removed from the System keychain, the cert and log directories are deleted,
+# the installer receipt is forgotten, and ports 9100/9101 are confirmed free at
+# the end. Nothing is left behind that could resurrect the agent at the next
+# login or keep a stale trusted cert in the keychain.
 #
 # Usage:
 #   sudo __UNINSTALLER_NAME__ [--user <account>] [--keep-cert]
@@ -34,6 +34,11 @@ BINARY="__BINARY_PATH__"
 UNINSTALLER="__UNINSTALLER_PATH__"
 LIBEXEC_DIR="__LIBEXEC_DIR__"
 AGENT_PLIST="/Library/LaunchAgents/${LABEL}.plist"
+UPDATER="__UPDATER_PATH__"
+UPDATER_LABEL="__UPDATER_LABEL__"
+UPDATER_PLIST="__UPDATER_PLIST_PATH__"
+SYSTEM_SUPPORT_DIR="__SYSTEM_SUPPORT_DIR__"
+SYSTEM_LOG_DIR="__SYSTEM_LOG_DIR__"
 SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 PORTS=(9100 9101)
 PORT_SETTLE_SECONDS=10
@@ -52,10 +57,10 @@ usage() {
 	cat <<-EOF
 		Usage: sudo $(basename "$0") [--user <account>] [--keep-cert]
 
-		Removes the macOS print agent from this station: stops and
-		unregisters the LaunchAgent, deletes the binary and launcher, untrusts
-		and deletes the station cert, removes the cert and log directories,
-		forgets the installer receipt, and confirms ports 9100/9101 are free.
+		Removes the macOS print agent from this station: stops both launchd
+		jobs, deletes the payload and updater state, untrusts and deletes the
+		station cert, removes the cert and log directories, forgets the
+		installer receipt, and confirms ports 9100/9101 are free.
 
 		  --user <account>  Operate on this account rather than the console user.
 		                    Cert and log paths are per-account, so a station with
@@ -114,8 +119,18 @@ if [ -n "$TARGET_USER" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Stop and unregister the LaunchAgent
+# 1. Stop and unregister the launchd jobs
 # ---------------------------------------------------------------------------
+
+log "stopping $UPDATER_LABEL in the system domain"
+/bin/launchctl bootout "system/$UPDATER_LABEL" >/dev/null 2>&1 || true
+# Clear a persisted administrator pin as part of a full uninstall. Normal
+# package upgrades never execute this path, so their pin remains intact.
+/bin/launchctl enable "system/$UPDATER_LABEL" >/dev/null 2>&1 || true
+if [ -f "$UPDATER_PLIST" ]; then
+	log "removing $UPDATER_PLIST"
+	/bin/rm -f "$UPDATER_PLIST"
+fi
 
 if [ -n "$TARGET_UID" ]; then
 	log "stopping $LABEL in gui/$TARGET_UID"
@@ -136,6 +151,7 @@ fi
 
 # Anything still running after the job is gone (a hand-started agent, say).
 /usr/bin/pkill -f "$BINARY" >/dev/null 2>&1 || true
+/usr/bin/pkill -f "$UPDATER" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # 2. Untrust and delete the station cert
@@ -181,7 +197,7 @@ fi
 # 3. Remove the payload and the receipt
 # ---------------------------------------------------------------------------
 
-for path in "$BINARY" "$LIBEXEC_DIR"; do
+for path in "$BINARY" "$LIBEXEC_DIR" "$SYSTEM_SUPPORT_DIR" "$SYSTEM_LOG_DIR"; do
 	if [ -e "$path" ]; then
 		log "removing $path"
 		/bin/rm -rf "$path"

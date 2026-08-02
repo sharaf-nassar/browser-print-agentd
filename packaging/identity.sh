@@ -37,8 +37,19 @@ UNINSTALLER_NAME="${BINARY_NAME}-uninstall"
 UNINSTALLER_PATH="/usr/local/bin/${UNINSTALLER_NAME}"
 LIBEXEC_DIR="/usr/local/libexec/${PRODUCT_NAME}"
 LAUNCHER_PATH="${LIBEXEC_DIR}/launcher"
+UPDATER_NAME="updater"
+UPDATER_PATH="${LIBEXEC_DIR}/${UPDATER_NAME}"
 PLIST_NAME="${BUNDLE_ID}.plist"
 AGENT_PLIST_PATH="/Library/LaunchAgents/${PLIST_NAME}"
+UPDATER_LABEL="${BUNDLE_ID}.updater"
+UPDATER_PLIST_NAME="${UPDATER_LABEL}.plist"
+UPDATER_PLIST_PATH="/Library/LaunchDaemons/${UPDATER_PLIST_NAME}"
+
+# Root-owned updater state and logging. These are separate from the agent's
+# per-account support and log directories below.
+SYSTEM_SUPPORT_DIR="/Library/Application Support/${PRODUCT_NAME}"
+UPDATE_STATE_DIR="${SYSTEM_SUPPORT_DIR}/updater"
+SYSTEM_LOG_DIR="/Library/Logs/${PRODUCT_NAME}"
 
 # Per-account directories, relative to a home directory. Names only: the home
 # they hang off is resolved at install time against the station account, never
@@ -54,6 +65,12 @@ TARGET_USER_ENV="${ENV_PREFIX}_TARGET_USER"
 # it is the shared prefix for every temp file the product creates, including the
 # Go side's spool files.
 TEMP_PREFIX="browser-print"
+
+# Public release feed. Derive the GitHub owner from the reverse-DNS namespace
+# so the repository identity is not restated in an updater template.
+RELEASE_OWNER="${BUNDLE_PREFIX#io.github.}"
+RELEASE_REPOSITORY="${RELEASE_OWNER}/${PRODUCT_NAME}"
+RELEASE_BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases"
 
 # Build-time artifact names.
 COMPONENT_PKG_NAME="${PRODUCT_NAME}-component.pkg"
