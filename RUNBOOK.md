@@ -432,6 +432,7 @@ curl -fsS http://127.0.0.1:9100/health
 | 200, a CUPS error alongside the version     | Agent is alive and blind to CUPS — that is itself the diagnosis | [CUPS side](#the-cups-side)                          |
 | 200 and healthy, but the caller disagrees   | Browser-side: cert, port, or pinned printer                     | [Browser side](#the-browser-side)                    |
 | 200 and healthy, and the caller says "Sent" | The job reached CUPS; the failure is past the agent             | [The job left, no label](#the-job-left-but-no-label) |
+| A label printed, but upside down            | The queue's driver flips the page and was not recognised        | [Upside down](#a-pdf-label-prints-upside-down)       |
 
 `GET /health` is always the first call. Unlike `/available`, which hides unhealthy printers so a
 caller can never pin one, `/health` lists **every** discovered queue with its verdict, and it
@@ -630,6 +631,37 @@ media out, or a label that printed as a bitmap because something spooled without
 printer that is not paused and still swallows jobs usually needs its one-time bring-up — SmartCal,
 Label Top offset, print rate and darkness.
 
+### A PDF label prints upside down
+
+`POST /print-pdf` compensates for a driver that flips the page, and the compensation is applied
+only to queues whose driver actually flips. If a rendered sheet comes out inverted, the question is
+whether the agent recognised the driver:
+
+```bash
+lpoptions -p <queue> | tr ' ' '\n' | grep printer-make-and-model
+```
+
+CUPS's own label driver reports `Zebra ZPL Label Printer`. That driver's filter writes a literal
+`^POI` — "invert 180" — into every job it renders, with no option or device default that can switch
+it off, so the agent counter-rotates those jobs with `-o orientation-requested=6`. A queue with any
+other driver is left alone on purpose: rotating one that does not flip would turn a correct page
+upside down.
+
+Three things make a sheet come out inverted anyway:
+
+- **The queue reports a different driver.** A queue rebuilt against a vendor PPD or as IPP
+  Everywhere does not go through that filter, so it should not be inverted in the first place — if
+  it is, the flip is coming from somewhere else and `lpstat -l -p <queue>` will name the PPD.
+- **`lpoptions` is missing or the queue is wedged.** An unanswerable driver probe is treated as
+  "does not flip", which leaves the job unrotated. This direction is deliberate — the alternative
+  is inverting every queue on the station on a guess — but it means a broken probe looks exactly
+  like the original bug. Confirm `which lpoptions` resolves.
+- **The verdict is cached for five minutes.** After changing a queue's driver, either wait it out
+  or restart the agent with `launchctl kickstart -k gui/$(id -u)/io.github.sharaf-nassar.browser-print-agentd`.
+
+`POST /write` is unaffected in all cases: ZPL is sent raw and whatever `^PO` command the caller put
+in the label is what the printer obeys.
+
 ### Sleep, wake, and reboot
 
 Nothing needs restarting by hand. The LaunchAgent has `RunAtLoad` and `KeepAlive`, so it comes back
@@ -821,3 +853,22 @@ experiment. It needs two notarized `.pkg`s that were actually published under `v
 
 Record the observed result under [Rolling back](#rolling-back-to-the-previous-release), replacing
 its "not yet hardware-validated" note.
+
+### 12. A rendered PDF sheet prints the same way up as a pinned ZPL label
+
+This is the one item that proves the driver-orientation compensation, and it cannot be proven by
+CI: automated coverage stops at the `lp` argv, while whether the page lands upright is a property
+of the filter chain and the physical printer. Use content with an unambiguous top — a solid bar
+across the top quarter is enough.
+
+- [ ] `lpoptions -p <queue> | tr ' ' '\n' | grep printer-make-and-model` reports the driver, and
+      the station's Zebra queue reports `Zebra ZPL Label Printer`.
+- [ ] `POST /write` a ZPL label that pins its own orientation. Record which way up it comes out.
+- [ ] `POST /print-pdf` the same content rendered as a PDF. It comes out **the same way up**, not
+      inverted.
+- [ ] The agent log shows both jobs going to the same queue — a fallback to a different printer
+      changes which driver applied and invalidates the comparison.
+- [ ] On a second queue whose driver is NOT `Zebra ZPL Label Printer` (add one temporarily if the
+      station has none), a `/print-pdf` sheet is **not** inverted either. This is the half that
+      catches an over-eager compensation, and it is the failure a station would otherwise discover
+      only after a shift printed upside down.

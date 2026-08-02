@@ -150,6 +150,56 @@ needs to know whether a station has it reads `X-Print-Agent-Version`, which is s
 version channel — the route is not advertised through `/available`, so an older agent answers a
 sheet request with the plain-text `404` its default arm has always produced.
 
+### Driver-Forced Orientation
+
+A PDF that renders correctly still comes out upside down on a queue driven by CUPS's own label
+filter, and the agent — not the caller — is what corrects it. `[[cups.go#invertingDriver]]` decides
+whether the destination flips and `[[cups.go#cupsClient#printDocument]]` cancels it.
+
+`rastertolabel` writes a literal `^POI` — ZPL for "invert 180" — into every job its `ZEBRA_ZPL`
+arm produces, with the source comment "Rotate 180 degrees so that the top of the label/page is at
+the leading edge". It is a straight-line `puts` with no branch, no PPD option, and no device
+default behind it, so nothing handed to `lp` can switch it off. The PPD (`Zebra ZPL Label Printer`,
+`*cupsFilter: "application/vnd.cups-raster 50 rastertolabel"`) exposes no orientation option at
+all. Three prints settled it: ZPL pinning `^PON` printed upright, ZPL with no `^PO` printed
+inverted, and a PDF through `/print-pdf` printed inverted.
+
+The only lever left is upstream of the filter, so `/print-pdf` passes `-o orientation-requested=6`
+— IPP reverse-portrait — which makes the PDF-to-raster stage hand `rastertolabel` an
+already-inverted raster that its own `^POI` rights again. This was measured, not assumed: running
+the real chain (`ppdc -d ppd /usr/share/cups/drv/sample.drv`, then `cupsfilter -p ppd/zebra.ppd -m
+printer/foo -e`) and decoding the emitted `~DGR:CUPS.GRF` payload back to a bitmap shows the black
+bar's pixel mass moving from the top quarter to the bottom quarter (234904/9744 → 9744/234904)
+while `^POI` stays in the output unchanged. `=3` is byte-identical to passing nothing; `=4`, `=5`
+and `-o landscape` rotate 90° and crop.
+
+**Two things about this must not be "simplified".**
+
+**It is conditional, and unconditional rotation would be a worse bug than the one it fixes.** The
+obvious edit — always pass the option, since the station is a label printer anyway — inverts a
+correct page on every queue whose driver does not flip, and does it silently, which is the failure
+class this agent exists to eliminate. `[[tests#Agent Core#Print PDF Leaves A Non Inverting Driver
+Alone]]` fails if the option ever reaches a non-flipping queue.
+
+**It is keyed on the DRIVER, not on "the queue uses `rastertolabel`".** That one filter binary
+drives six label languages off the PPD's `*cupsModelNumber`, and the `^POI` lives in exactly one of
+them. A DYMO, CPCL, or EPL queue runs the same binary and does NOT flip, so filter-based detection
+would invert three families of printer that print correctly today. It is equally not keyed on
+"Zebra": a Zebra queue driven by a vendor PPD or by IPP Everywhere never reaches this filter.
+
+The probe is `lpoptions -p <queue>`, read for `printer-make-and-model` — the PPD's `*NickName`
+republished over IPP. The PPD file itself is not the source because CUPS writes
+`/etc/cups/ppd/<queue>.ppd` as `0640 root:lp` and the agent does not run as root, so a file-based
+probe would fail on every station and the compensation would silently never apply.
+`[[health.go#driverChecker]]` caches the verdict for five minutes, next to the health cache and for
+the opposite reason: health changes minute to minute, a driver changes only when an operator
+reinstalls the printer. Any probe failure reads as "does not flip" — the direction that leaves the
+known bug in place rather than inverting every queue on the station on a guess.
+
+The verdict is taken for the queue `[[server.go#agent#resolveTarget]]` actually returned, not the
+one the caller asked for. Failover can move a job to a different printer with a different driver,
+and compensating for a printer the job did not go to is how this fix becomes the bug.
+
 ## Origin Posture
 
 The loopback surface has no token, so any page the operator visits could otherwise enumerate

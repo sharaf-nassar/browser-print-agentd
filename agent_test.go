@@ -48,6 +48,34 @@ const (
 	acceptingLine = "%s accepting requests since Fri Jul 24 16:02:07 2026\n"
 	rejectingLine = "%s not accepting requests since Fri Jul 24 16:02:21 2026 -\n\tRejecting Jobs\n"
 	deviceLine    = "device for %s: %s\n"
+
+	// `lpoptions -p <queue>` in the shape CUPS emits it: the WHOLE destination on
+	// ONE line as space-separated key=value pairs, with a value carrying spaces
+	// single-quoted — which the driver identity always is. The surrounding pairs
+	// are kept so the parser has to find its key in a crowd rather than in a
+	// one-field line. First %s is the queue, second the driver NickName.
+	optionsLine = "copies=1 finishings=3 job-cancel-after=10800 job-hold-until=no-hold " +
+		"job-priority=50 job-sheets=none,none marker-change-time=0 number-up=1 " +
+		"printer-info=%s printer-is-accepting-jobs=true printer-is-shared=true " +
+		"printer-make-and-model='%s' printer-state=3 printer-state-reasons=none " +
+		"printer-type=8450124\n"
+)
+
+// Driver identities `lpoptions` can report, as CUPS's own label driver spells
+// them in its *NickName.
+const (
+	// zplModel is the driver whose rastertolabel arm emits an unconditional
+	// `^POI`, so a document bound for it needs the counter-rotation.
+	zplModel = "Zebra ZPL Label Printer"
+
+	// cpclModel is the SAME rastertolabel binary driving a different label
+	// language. Its arm of the filter's model-number switch emits no `^POI`, so
+	// it must be left alone — which is why detection cannot key on the filter.
+	cpclModel = "Zebra CPCL Label Printer"
+
+	// rawModel is what a queue with no driver reports, and the stock test
+	// station's default: nothing about it forces orientation.
+	rawModel = "Local Raw Printer"
 )
 
 // Queue states the fake can put a printer in.
@@ -73,19 +101,56 @@ type fakeCUPS struct {
 	lpCalls []lpCall
 	lpExit  int
 	lpErr   string
+
+	// models is the driver identity `lpoptions -p <queue>` publishes per queue.
+	// A queue with no entry reports rawModel — no driver, nothing that forces
+	// orientation — so a test that says nothing about drivers gets a station
+	// where no job is counter-rotated.
+	models map[string]string
+
+	// optionCalls counts lpoptions invocations so a test can prove the driver
+	// verdict is cached rather than re-forked per job.
+	optionCalls int
+
+	// optionsFail makes every lpoptions invocation fail the way a missing binary
+	// does, to pin what an unanswerable driver probe is treated as.
+	optionsFail bool
 }
 
-// Run answers lpstat from the queue-state map and records lp without running it.
+// Run answers lpstat and lpoptions from the queue maps and records lp without
+// running it.
 func (f *fakeCUPS) Run(ctx context.Context, name string, args ...string) (execResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch name {
 	case "lpstat":
 		return f.lpstat(args)
+	case "lpoptions":
+		return f.lpoptions(args)
 	case "lp":
 		return f.lp(args)
 	}
 	return execResult{}, fmt.Errorf("unexpected command in test: %s %v", name, args)
+}
+
+// lpoptions answers the driver probe for one queue.
+func (f *fakeCUPS) lpoptions(args []string) (execResult, error) {
+	f.optionCalls++
+	if f.optionsFail {
+		return execResult{}, fmt.Errorf("exec: \"lpoptions\": executable file not found in $PATH")
+	}
+	if len(args) < 2 || args[0] != "-p" {
+		return execResult{ExitCode: 1}, nil
+	}
+	queue := args[1]
+	if state, listed := f.states[queue]; !listed || state == stateAbsent {
+		return execResult{ExitCode: 1, Stderr: fmt.Sprintf(absentLine, queue)}, nil
+	}
+	model := rawModel
+	if named, ok := f.models[queue]; ok {
+		model = named
+	}
+	return execResult{Stdout: fmt.Sprintf(optionsLine, queue, model)}, nil
 }
 
 func (f *fakeCUPS) lpstat(args []string) (execResult, error) {
@@ -146,6 +211,22 @@ func (f *fakeCUPS) calls() []lpCall {
 	return append([]lpCall(nil), f.lpCalls...)
 }
 
+// driverProbes returns how many times the driver probe was forked.
+func (f *fakeCUPS) driverProbes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.optionCalls
+}
+
+// stationWithDriver is the standard two-printer station with a named driver on
+// every queue, so a test can say which driver the job's destination runs
+// without restating the station.
+func stationWithDriver(model string) *fakeCUPS {
+	fake := twoPrinterCUPS(stateEnabled, stateEnabled)
+	fake.models = map[string]string{usbQueue: model, netQueue: model}
+	return fake
+}
+
 // twoPrinterCUPS is the standard station: a USB ZD621 and a network Zebra,
 // enumerated network-first so the USB-first ordering is actually proven.
 func twoPrinterCUPS(usbState string, netState string) *fakeCUPS {
@@ -164,8 +245,10 @@ func startAgent(t *testing.T, fake *fakeCUPS, originAllow []string) (string, *by
 	t.Helper()
 	logs := &bytes.Buffer{}
 	handler := newAgent(fake, newAgentLogger(logs), originAllow)
-	// No health caching in tests: each assertion probes the fake's current state.
+	// No caching in tests: each assertion probes the fake's current state. The
+	// driver cache is disabled for the same reason and tested on its own.
 	handler.health.ttl = 0
+	handler.drivers.ttl = 0
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	return server.URL, logs
@@ -642,6 +725,175 @@ func TestPrintPDFSpoolsADocumentWithoutRaw(t *testing.T) {
 	}
 	if got := strings.Join(rawFake.calls()[0].Args, " "); !strings.Contains(got, "-o raw") {
 		t.Fatalf("/write lp argv = %q, want -o raw still present", got)
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Counter Rotates An Inverting Driver]]
+func TestPrintPDFCounterRotatesAnInvertingDriver(t *testing.T) {
+	fake := stationWithDriver(zplModel)
+	base, _ := startAgent(t, fake, nil)
+
+	status, body := postPrintPDF(t, base, "https://lab.example", map[string]any{
+		"device": map[string]any{"uid": stableUID(usbQueue, usbURI), "name": usbQueue},
+		"data":   base64.StdEncoding.EncodeToString(samplePDF),
+	})
+	if status != http.StatusOK || body != "" {
+		t.Fatalf("/print-pdf = %d %q, want 200 and an empty body", status, body)
+	}
+
+	calls := fake.calls()
+	if len(calls) != 1 {
+		t.Fatalf("lp calls = %d, want exactly one", len(calls))
+	}
+	argv := calls[0].Args
+	want := []string{"-d", usbQueue, "-o", "orientation-requested=6"}
+	if len(argv) != len(want)+1 {
+		t.Fatalf("lp argv = %v, want -d <queue> -o orientation-requested=6 <file>", argv)
+	}
+	for index, expected := range want {
+		if argv[index] != expected {
+			t.Fatalf("lp argv = %v, want %v followed by the spool path", argv, want)
+		}
+	}
+
+	// The counter-rotation must not have smuggled `-o raw` back onto this route:
+	// the option only works BECAUSE the filter chain runs, and raw would skip it.
+	for _, arg := range argv {
+		if arg == "raw" {
+			t.Fatalf("lp argv = %v, want NO -o raw on a rendered document", argv)
+		}
+	}
+	if !bytes.Equal(calls[0].Payload, samplePDF) {
+		t.Fatalf("spooled %d bytes, want the %d-byte decoded PDF verbatim",
+			len(calls[0].Payload), len(samplePDF))
+	}
+
+	// /write is untouched by the driver: ZPL is printer-native, the caller has
+	// already said which way up it wants the label with its own ^PO command, and
+	// nothing in the raw path goes near the filter that flips.
+	zplFake := stationWithDriver(zplModel)
+	zplBase, _ := startAgent(t, zplFake, nil)
+	if status, body := postWrite(t, zplBase, "", map[string]any{"data": "^XA^PON^XZ"}); status != 200 {
+		t.Fatalf("/write = %d %q, want 200", status, body)
+	}
+	rawArgv := strings.Join(zplFake.calls()[0].Args, " ")
+	if !strings.Contains(rawArgv, "-o raw") {
+		t.Fatalf("/write lp argv = %q, want -o raw still present", rawArgv)
+	}
+	if strings.Contains(rawArgv, "orientation-requested") {
+		t.Fatalf("/write lp argv = %q, want NO orientation option on the raw path", rawArgv)
+	}
+}
+
+// @lat: [[tests#Agent Core#Print PDF Leaves A Non Inverting Driver Alone]]
+func TestPrintPDFLeavesANonInvertingDriverAlone(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func() *fakeCUPS
+	}{
+		// The same rastertolabel binary driving a different label language. Its
+		// arm of the filter's switch emits no ^POI, so keying detection on the
+		// FILTER instead of the driver would invert this queue.
+		{"same filter, different language", func() *fakeCUPS { return stationWithDriver(cpclModel) }},
+		// No driver at all, which is what the stock station reports.
+		{"no driver", func() *fakeCUPS { return stationWithDriver(rawModel) }},
+		// A queue that publishes no model line whatsoever.
+		{"no model published", func() *fakeCUPS {
+			fake := twoPrinterCUPS(stateEnabled, stateEnabled)
+			fake.models = map[string]string{usbQueue: "", netQueue: ""}
+			return fake
+		}},
+		// An unanswerable probe: no lpoptions binary, or a hung device blowing
+		// the command timeout. Rotating on a guess would put every queue on the
+		// station upside down; not rotating leaves the known bug as it is.
+		{"probe fails", func() *fakeCUPS {
+			fake := stationWithDriver(zplModel)
+			fake.optionsFail = true
+			return fake
+		}},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fake := testCase.build()
+			base, _ := startAgent(t, fake, nil)
+
+			status, body := postPrintPDF(t, base, "https://lab.example", map[string]any{
+				"device": map[string]any{"uid": stableUID(usbQueue, usbURI), "name": usbQueue},
+				"data":   base64.StdEncoding.EncodeToString(samplePDF),
+			})
+			if status != http.StatusOK || body != "" {
+				t.Fatalf("/print-pdf = %d %q, want 200 and an empty body", status, body)
+			}
+
+			calls := fake.calls()
+			if len(calls) != 1 {
+				t.Fatalf("lp calls = %d, want exactly one", len(calls))
+			}
+			argv := calls[0].Args
+			if len(argv) != 3 || argv[0] != "-d" || argv[1] != usbQueue {
+				t.Fatalf("lp argv = %v, want exactly -d <queue> <file>: a driver that "+
+					"does not flip must be spooled unrotated, or the compensation "+
+					"becomes the bug", argv)
+			}
+			if strings.Contains(strings.Join(argv, " "), "orientation") {
+				t.Fatalf("lp argv = %v, want NO orientation option", argv)
+			}
+		})
+	}
+}
+
+// @lat: [[tests#Agent Core#Driver Detection Reads The Queue Model And Caches It]]
+func TestDriverDetectionReadsTheQueueModelAndCachesIt(t *testing.T) {
+	// The lpoptions line the parser actually has to cope with: one crowded line,
+	// the wanted value single-quoted because it carries spaces.
+	models := []struct {
+		output    string
+		model     string
+		inverting bool
+	}{
+		{fmt.Sprintf(optionsLine, usbQueue, zplModel), zplModel, true},
+		{fmt.Sprintf(optionsLine, usbQueue, cpclModel), cpclModel, false},
+		{fmt.Sprintf(optionsLine, usbQueue, rawModel), rawModel, false},
+		// A NickName with a trailing qualifier still resolves; an unrelated
+		// driver whose name merely contains a word or two does not.
+		{"printer-make-and-model='Zebra  ZPL  Label  Printer, 1.4' printer-state=3\n",
+			"Zebra  ZPL  Label  Printer, 1.4", true},
+		{"printer-make-and-model='Zebra ZD621 IPP Everywhere' printer-state=3\n",
+			"Zebra ZD621 IPP Everywhere", false},
+		// An unquoted value ends at the field boundary, not at the line end.
+		{"printer-info=q printer-make-and-model=Generic printer-state=3\n", "Generic", false},
+		// A longer key must not be mistaken for this one, and a line without the
+		// key at all reads as no answer rather than as a guess.
+		{"cups-printer-make-and-model='Zebra ZPL Label Printer'\n", "", false},
+		{"copies=1 printer-state=3\n", "", false},
+	}
+	for _, want := range models {
+		if got := parseDriverModel(want.output); got != want.model {
+			t.Fatalf("parseDriverModel(%q) = %q, want %q", want.output, got, want.model)
+		}
+		if got := invertingDriver(want.model); got != want.inverting {
+			t.Fatalf("invertingDriver(%q) = %v, want %v", want.model, got, want.inverting)
+		}
+	}
+
+	// The verdict is cached: a driver does not change between jobs, and forking
+	// lpoptions per page would put a command in front of every print.
+	fake := stationWithDriver(zplModel)
+	checker := newDriverChecker(newCUPSClient(fake))
+	for attempt := 0; attempt < 3; attempt++ {
+		if !checker.inverting(context.Background(), usbQueue) {
+			t.Fatalf("inverting(%s) = false on attempt %d, want true", usbQueue, attempt)
+		}
+	}
+	if probes := fake.driverProbes(); probes != 1 {
+		t.Fatalf("lpoptions probes = %d across three jobs, want exactly one", probes)
+	}
+	if !checker.inverting(context.Background(), netQueue) {
+		t.Fatalf("inverting(%s) = false, want true", netQueue)
+	}
+	if probes := fake.driverProbes(); probes != 2 {
+		t.Fatalf("lpoptions probes = %d, want one per queue rather than one overall", probes)
 	}
 }
 

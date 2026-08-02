@@ -11,6 +11,15 @@ import (
 // burst of endpoint hits does not spawn an lpstat pair per request.
 const healthCacheTTL = 3 * time.Second
 
+// driverCacheTTL bounds how stale a driver verdict may be. It is far longer
+// than healthCacheTTL because the two answer different kinds of question: a
+// queue's health changes minute to minute, while the driver behind it changes
+// only when an operator reinstalls the printer. Re-probing per job would put an
+// `lpoptions` fork in front of every page for an answer that is effectively
+// constant; never re-probing would mean a long-lived agent kept a stale verdict
+// until it was restarted.
+const driverCacheTTL = 5 * time.Minute
+
 // healthChecker answers "can this queue actually print right now", caching the
 // verdict briefly and probing queues concurrently so a station with several
 // printers still answers `GET /available` inside the SPA's 1500 ms probe abort.
@@ -70,6 +79,64 @@ func (h *healthChecker) healthy(ctx context.Context, queue string) bool {
 	h.entries[queue] = healthEntry{at: h.now(), healthy: healthy}
 	h.mu.Unlock()
 	return healthy
+}
+
+// driverChecker answers "does this queue's driver flip the page", caching the
+// verdict for driverCacheTTL. It mirrors healthChecker deliberately — same
+// cache shape, same injectable clock, same "any probe error is the safe
+// answer" rule — because it is the same kind of thing: a per-queue property
+// read out of CUPS that a print route must not fork a command for on every job.
+type driverChecker struct {
+	cups *cupsClient
+	ttl  time.Duration
+	now  func() time.Time
+
+	mu      sync.Mutex
+	entries map[string]driverEntry
+}
+
+// driverEntry is one cached driver verdict and when it was taken.
+type driverEntry struct {
+	at        time.Time
+	inverting bool
+}
+
+// newDriverChecker builds a checker over cups with the default cache TTL.
+func newDriverChecker(cups *cupsClient) *driverChecker {
+	return &driverChecker{
+		cups:    cups,
+		ttl:     driverCacheTTL,
+		now:     time.Now,
+		entries: map[string]driverEntry{},
+	}
+}
+
+// inverting reports whether the queue's driver rotates every rendered page 180
+// degrees, so a document bound for it needs the counter-rotation.
+//
+// A probe error — no `lpoptions` binary, a hung device blowing the command
+// timeout, an unparseable answer — reads as NOT inverting. That direction is
+// deliberate and is the opposite of a "fail closed" instinct: the compensation
+// is a rotation, so guessing wrong in the true direction turns an upright page
+// upside down on every queue on the station, while guessing wrong in the false
+// direction leaves the known bug exactly as it already is. Only a positively
+// identified inverting driver gets rotated.
+func (d *driverChecker) inverting(ctx context.Context, queue string) bool {
+	now := d.now()
+	d.mu.Lock()
+	entry, cached := d.entries[queue]
+	d.mu.Unlock()
+	if cached && now.Sub(entry.at) < d.ttl {
+		return entry.inverting
+	}
+
+	model, err := d.cups.driverModel(ctx, queue)
+	inverting := err == nil && invertingDriver(model)
+
+	d.mu.Lock()
+	d.entries[queue] = driverEntry{at: d.now(), inverting: inverting}
+	d.mu.Unlock()
+	return inverting
 }
 
 // healthyPrinters filters printers down to the ones that can print, preserving

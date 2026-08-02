@@ -67,9 +67,10 @@ func (r printRequest) requestedPrinter() string {
 
 // agent serves the Browser Print wire contract on top of CUPS.
 type agent struct {
-	cups   *cupsClient
-	health *healthChecker
-	logger *agentLogger
+	cups    *cupsClient
+	health  *healthChecker
+	drivers *driverChecker
+	logger  *agentLogger
 
 	// originAllow is the Q14 posture. Empty means log-and-allow: every origin is
 	// recorded and permitted. Non-empty turns /write into an allowlisted
@@ -84,6 +85,7 @@ func newAgent(runner execRunner, logger *agentLogger, originAllow []string) *age
 	return &agent{
 		cups:        cups,
 		health:      newHealthChecker(cups),
+		drivers:     newDriverChecker(cups),
 		logger:      logger,
 		originAllow: originAllow,
 	}
@@ -249,7 +251,9 @@ func (a *agent) handleWrite(w http.ResponseWriter, r *http.Request, origin strin
 // empty-200/plain-text-error convention — so a sheet and a label can never
 // disagree about which printer is usable or whether a station is dead.
 //
-// The one thing that must differ is the lp invocation: see printDocument.
+// The lp invocation is what must differ, in two ways: no `-o raw`, and a
+// counter-rotation when the destination's driver flips the page. See
+// printDocument for both.
 func (a *agent) handlePrintPDF(w http.ResponseWriter, r *http.Request, origin string) {
 	// Identical gate to /write, and load-bearing for the same reason. This route
 	// spools to a physical printer, so leaving it off the allowlist would make
@@ -303,7 +307,13 @@ func (a *agent) handlePrintPDF(w http.ResponseWriter, r *http.Request, origin st
 		return
 	}
 
-	requestID, err := a.cups.printDocument(ctx, target.Queue, document)
+	// Asked of the RESOLVED queue, not the requested one: failover may have moved
+	// the job to a different printer with a different driver, and compensating
+	// for the driver of a printer the job did not go to is how a fix like this
+	// turns into the bug it was meant to remove.
+	inverting := a.drivers.inverting(ctx, target.Queue)
+
+	requestID, err := a.cups.printDocument(ctx, target.Queue, document, inverting)
 	if err != nil {
 		a.logger.job("print-pdf", false, len(document), target, "", origin)
 		sendText(w, http.StatusInternalServerError, err.Error()+"\n")

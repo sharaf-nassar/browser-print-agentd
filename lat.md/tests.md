@@ -99,6 +99,43 @@ against is symmetrical and silent. `-o raw` on a PDF hands unrendered bytes to t
 its absence on ZPL lets `zebra.ppd` rasterize the label. Neither errors — both print the wrong
 thing — so a future editor "unifying" the two lp invocations has to break a named assertion.
 
+### Print PDF Counter Rotates An Inverting Driver
+
+Verifies a `/print-pdf` job bound for a queue reporting the `Zebra ZPL Label Printer` driver is
+spooled as exactly `-d <queue> -o orientation-requested=6 <file>`, while `/write` on that station
+keeps `-o raw` and no orientation.
+
+The value is asserted literally because it is not guessable. IPP `orientation-requested=6` is
+reverse-portrait — a 180° rotation applied by the PDF-to-raster stage, which is what makes the
+label filter's own unconditional `^POI` cancel out. `=3` is a no-op and `=4`/`=5` rotate 90° and
+crop. The same test re-asserts the absence of `-o raw`, since the counter-rotation only works
+BECAUSE the filter chain runs and a future editor adding raw would silently undo it.
+
+### Print PDF Leaves A Non Inverting Driver Alone
+
+Verifies no orientation option reaches `lp` when the driver does not flip: a Zebra CPCL queue (the
+SAME filter binary, a different label language), a queue with no driver, one publishing no model,
+and one whose probe fails.
+
+This is the half that makes the fix safe rather than merely effective. An unconditional rotation
+would double-invert every one of these cases, turning a correct page upside down on printers that
+were never broken — a strictly worse bug, and an equally silent one. The CPCL case is the sharpest
+of the four: it proves detection is keyed on the DRIVER and not on "the queue uses `rastertolabel`",
+which would have inverted three label families that share the binary but not the `^POI`. The
+failed-probe case pins the direction of the safe default: an unanswerable probe means no rotation.
+
+### Driver Detection Reads The Queue Model And Caches It
+
+Verifies `[[cups.go#parseDriverModel]]` pulls `printer-make-and-model` out of a crowded one-line
+`lpoptions -p` answer — quoted, unquoted, absent, key-shadowed — and that
+`[[cups.go#invertingDriver]]` matches the ZPL driver but not its CPCL sibling or an IPP Everywhere
+Zebra.
+
+It also pins the caching contract in `[[health.go#driverChecker#inverting]]`: three jobs to one
+queue fork the probe once, while a second queue is probed separately. A queue's driver does not
+change between jobs, so re-forking `lpoptions` per page would put a command in front of every
+print for an answer that is effectively constant.
+
 ### Print PDF Rejects A Payload That Is Not A PDF
 
 Verifies a `data` field that will not base64-decode, one that decodes to something without the
