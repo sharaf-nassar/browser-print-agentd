@@ -15,19 +15,18 @@
 #      when this pair exists, exactly like the reference shim — no cert means no
 #      HTTPS, which the SPA surfaces as the Safari setup walkthrough instead of
 #      failing silently.
-#   2. Trust that cert in the System keychain, restricted to the SSL policy, so
-#      Safari accepts https://localhost:9101. This happens HERE, under root, on
-#      purpose: operators may not have admin rights, so trusting a cert is an
-#      install-time admin action and never something a mid-shift operator is
-#      asked to do (plan S3/Q3).
-#   3. Bootstrap the LaunchAgent into the console user's GUI session so the
+#   2. Bootstrap the LaunchAgent into the console user's GUI session so the
 #      station is printing without a logout, and leave it registered in
 #      /Library/LaunchAgents so launchd starts it again at every login and
 #      restarts it after a crash (G6).
-#   4. Verify the agent actually answers on :9100 before reporting success. An
+#   3. Verify the agent actually answers on :9100 before reporting success. An
 #      install that "succeeded" while the agent is dead is precisely the phantom
 #      success this project exists to eliminate, so a failed probe fails the
 #      install.
+#   4. Wait for :9101, then prove the System keychain already accepts the
+#      station cert before mutating trust. Existing trust is left untouched;
+#      first installs add SSL-only trust and prove it with the same normal TLS
+#      probe. This keeps upgrades noninteractive without weakening Safari.
 #   5. Register the separate root updater in the system domain without
 #      disturbing an already-running update or an administrator's disabled pin.
 #
@@ -57,6 +56,7 @@ INSTALL_MARKER="/var/run/__PRODUCT_NAME__-installing"
 SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 
 HTTP_PORT=9100
+HTTPS_PORT=9101
 
 # Apple refuses to trust a TLS server cert whose validity exceeds 825 days. Two
 # years leaves comfortable headroom; renewal is a re-run of this installer,
@@ -242,21 +242,7 @@ for path in "$LOG_FILE" "$LOG_FILE".{1..7}; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Trust the cert
-# ---------------------------------------------------------------------------
-
-# The System keychain, not the login keychain: trust has to be machine-wide and
-# admin-owned so an operator without admin rights still gets a working Safari.
-# `-p ssl` keeps the trust to TLS server evaluation — a station-local cert has
-# no business being trusted for code signing or S/MIME.
-log "trusting the station cert in the System keychain (SSL policy only)"
-if ! /usr/bin/security add-trusted-cert -d -r trustRoot -p ssl \
-	-k "$SYSTEM_KEYCHAIN" "$CERT_FILE"; then
-	fail "could not add the station cert to the System keychain. Safari will refuse https://localhost:9101 until this succeeds; Chromium stations keep working over http://localhost:$HTTP_PORT."
-fi
-
-# ---------------------------------------------------------------------------
-# 3. Bootstrap the LaunchAgent
+# 2. Bootstrap the LaunchAgent
 # ---------------------------------------------------------------------------
 
 log "bootstrapping $LABEL into gui/$TARGET_UID"
@@ -270,7 +256,7 @@ fi
 /bin/launchctl kickstart -k "gui/$TARGET_UID/$LABEL" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-# 4. Verify the agent is actually serving
+# 3. Verify the agent is actually serving over HTTP
 # ---------------------------------------------------------------------------
 
 log "waiting for the agent to answer on http://127.0.0.1:$HTTP_PORT/available"
@@ -286,6 +272,48 @@ until /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$HTTP_PORT/available" >/
 done
 
 log "agent is serving on http://127.0.0.1:$HTTP_PORT"
+
+# ---------------------------------------------------------------------------
+# 4. Verify HTTPS readiness and establish trust only when needed
+# ---------------------------------------------------------------------------
+
+# A normal SecureTransport request is the behavioral trust check. It avoids
+# parsing localized keychain output and, crucially, avoids asking a background
+# updater to authorize a redundant System-keychain mutation. First prove the
+# TLS listener itself is ready with certificate verification disabled; only
+# then can a normal request distinguish missing trust from startup latency.
+log "waiting for the agent to answer on https://localhost:$HTTPS_PORT/available"
+attempt=0
+until /usr/bin/curl -k -fsS --max-time 2 \
+	"https://localhost:$HTTPS_PORT/available" >/dev/null 2>&1; do
+	attempt=$((attempt + 1))
+	if [ "$attempt" -ge "$PROBE_ATTEMPTS" ]; then
+		/bin/launchctl print "gui/$TARGET_UID/$LABEL" 2>&1 | /usr/bin/head -40 >&2 || true
+		/usr/bin/tail -20 "$LOG_FILE" >&2 2>/dev/null || true
+		fail "the agent answered on HTTP port $HTTP_PORT but its HTTPS listener did not answer on port $HTTPS_PORT after $PROBE_ATTEMPTS attempts. Safari printing is unavailable — see $LOG_FILE and the launchctl state above."
+	fi
+	sleep 1
+done
+
+log "agent is serving TLS on https://localhost:$HTTPS_PORT"
+if /usr/bin/curl -fsS --max-time 2 \
+	"https://localhost:$HTTPS_PORT/available" >/dev/null 2>&1; then
+	log "existing station cert trust is valid; leaving the System keychain unchanged"
+else
+	# The System keychain, not the login keychain: trust has to be machine-wide
+	# and admin-owned so an operator without admin rights still gets a working
+	# Safari. `-p ssl` restricts the trust to TLS server evaluation.
+	log "station cert is not yet trusted; adding System-keychain trust (SSL policy only)"
+	if ! /usr/bin/security add-trusted-cert -d -r trustRoot -p ssl \
+		-k "$SYSTEM_KEYCHAIN" "$CERT_FILE"; then
+		fail "could not add the station cert to the System keychain after the HTTPS listener became ready. Safari will refuse https://localhost:$HTTPS_PORT; Chromium stations keep working over http://localhost:$HTTP_PORT."
+	fi
+	if ! /usr/bin/curl -fsS --max-time 2 \
+		"https://localhost:$HTTPS_PORT/available" >/dev/null 2>&1; then
+		fail "the station cert was added to the System keychain, but a normal HTTPS trust probe still failed for https://localhost:$HTTPS_PORT/available. Safari trust is not usable."
+	fi
+	log "station cert trust established and verified"
+fi
 
 # Register the root updater after printing is healthy. A running updater job is
 # left alone during install-over-install: booting it out here would kill the

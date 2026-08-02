@@ -90,11 +90,13 @@ Everything else is root work the package scripts do for you:
   Anything else holding those ports — including a differently-named localhost print agent — would
   make a `KeepAlive` agent crash-loop, so the install stops loudly instead. Uninstall that agent
   first; see [the runbook](./RUNBOOK.md#migrating-from-another-localhost-print-agent).
-- **`postinstall`** generates a per-station self-signed cert pair (CN/SAN `localhost`, EKU
-  `serverAuth`) under `~/Library/Application Support/browser-print-agentd/`, trusts it in the
-  **System** keychain, bootstraps the LaunchAgent into `gui/<uid>` so printing works without a
-  logout, polls `http://127.0.0.1:9100/available`, then registers the separate root updater in the
-  system domain. A failed agent probe **fails the install**.
+- **`postinstall`** generates or reuses a per-station self-signed cert pair (CN/SAN `localhost`,
+  EKU `serverAuth`) under `~/Library/Application Support/browser-print-agentd/`, bootstraps the
+  LaunchAgent into `gui/<uid>`, and proves both listeners are ready. It then uses a normal
+  `https://localhost:9101/available` request as the trust check: working **System** keychain trust
+  is left untouched, while a first install adds SSL-only trust and requires that same request to
+  succeed. It finally registers the separate root updater. A failed HTTP, HTTPS, or trust probe
+  **fails the install**.
 
 Installed layout:
 
@@ -114,10 +116,12 @@ Installed layout:
 
 The updater wakes at load and every 86400 seconds, adds 0-900 seconds (up to 15 minutes) of
 per-run jitter, then exits after one check. The `v0.3.0` release-validation baseline alone used a
-60-second interval with 0-5 seconds of jitter; `v0.3.1` restores these production values. When
-`v0.3.0` automatically installs `v0.3.1`, launchd keeps the already loaded 60-second schedule
-until a reboot or an explicit updater bootout/bootstrap, even though the plist on disk contains
-86400. The updater does nothing without a console user. A strict three-line manifest at GitHub's
+60-second interval with 0-5 seconds of jitter. `v0.3.1` carried the production values but failed
+background installation when `postinstall` redundantly mutated already-working keychain trust;
+`v0.3.2` is the idempotent-trust recovery release. When `v0.3.0` automatically installs
+`v0.3.2`, launchd keeps the already loaded 60-second schedule until a reboot or an explicit
+updater bootout/bootstrap, even though the plist on disk contains 86400. The updater does nothing
+without a console user. A strict three-line manifest at GitHub's
 `releases/latest/download` feed is authoritative: any version difference triggers an install,
 including a downgrade when a bad latest release is yanked. Before replacement it caches and
 verifies the currently installed release package; an install or version-probe failure restores

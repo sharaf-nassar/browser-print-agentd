@@ -133,15 +133,17 @@ target volume.
    key), `CN=localhost`, `SAN=DNS:localhost,IP:127.0.0.1,IP:::1`, EKU `serverAuth`, 730 days —
    inside Apple's 825-day trust ceiling. An existing pair is **reused** unless it is within 30 days
    of expiry, so a reinstall or a rollback does not churn trust.
-2. **Trusts that certificate** in the **System** keychain with
-   `security add-trusted-cert -d -r trustRoot -p ssl`: machine-wide, admin-owned, and limited to
-   TLS server evaluation. This is why an operator is never asked to trust a certificate, and it
-   runs silently under the installer's root context — no password prompt, no keychain panel.
-3. **Bootstraps the LaunchAgent** into `gui/<uid>` from `/Library/LaunchAgents`, so the station
+2. **Bootstraps the LaunchAgent** into `gui/<uid>` from `/Library/LaunchAgents`, so the station
    prints immediately with no logout and launchd starts it again at every login.
-4. **Probes `http://127.0.0.1:9100/available` and fails the install if it does not answer** within
+3. **Probes `http://127.0.0.1:9100/available` and fails the install if it does not answer** within
    ~15 s, dumping `launchctl print` state and the tail of the agent log. An install that reports
    success while the agent is dead is the exact phantom success this agent exists to kill.
+4. **Proves the HTTPS listener and System-keychain trust separately.** A bounded `curl -k` waits
+   only for `https://localhost:9101/available` to serve the station cert. A normal request without
+   `-k` then tests actual SecureTransport trust. If it succeeds, `postinstall` leaves the keychain
+   unchanged. If it fails, a first install adds machine-wide, SSL-only trust with
+   `security add-trusted-cert -d -r trustRoot -p ssl`, then requires the normal request to pass.
+   No localized keychain output is parsed, and a trust failure fails the install.
 5. **Registers the updater LaunchDaemon** in the system domain after printing is healthy. A
    running updater is never booted out during install-over-install, and a disabled updater stays
    disabled, so package replacement cannot kill its own parent process or erase an admin pin.
@@ -170,6 +172,7 @@ The cert and agent log remain per-account under
 curl -fsS  http://127.0.0.1:9100/health       # version + every queue, healthy or not
 curl -fsS  http://127.0.0.1:9100/available    # what the caller will be offered, healthy only
 curl -fsSk https://127.0.0.1:9101/available   # Safari path; only served when the cert exists
+curl -fsS  https://localhost:9101/available   # Safari trust path; intentionally no -k
 launchctl print gui/$(id -u)/io.github.sharaf-nassar.browser-print-agentd | head -20
 ```
 
@@ -189,7 +192,9 @@ The package ships a short-lived root updater. It runs at load and every 86400 se
 seconds (up to 15 minutes) of jitter, performs one check, and exits. It skips when no station
 account is logged in at the console because the package's own `postinstall` needs that account.
 The `v0.3.0` release-validation baseline temporarily used a 60-second interval and 0-5 seconds of
-jitter; `v0.3.1` restores the production cadence described here.
+jitter. `v0.3.1` carried the production cadence but failed background installation when it tried
+to re-add already-working certificate trust. `v0.3.2` keeps the production cadence and makes that
+trust step behaviorally idempotent.
 
 The updater downloads the strict `update-manifest.txt` asset from the GitHub latest-release URL.
 The manifest names one version, package asset, and SHA-256 digest. Its version is compared with the
@@ -218,8 +223,9 @@ and keeps the cache, quarantine list, signing identity, and updater controls roo
 
 ### Validate release-to-release automatic updates
 
-Use this checklist to prove the accelerated baseline installs its production-cadence successor
-without a manual kickstart, then leave the station running the production cadence.
+Use this checklist to prove the accelerated baseline recovers automatically from the failed
+`v0.3.1` background install by installing fixed `v0.3.2`, without a manual install or agent
+kickstart, then leave the station running the production cadence.
 
 1. Install the accelerated `v0.3.0` baseline manually while the station account is logged in.
    Confirm its version and that the updater is enabled:
@@ -233,10 +239,21 @@ without a manual kickstart, then leave the station running the production cadenc
      grep 'run interval'
    ```
 
-   Expect a 60-second loaded interval and no true disabled override.
+   Expect a 60-second loaded interval and no true disabled override. If `v0.3.1` already attempted
+   its update and rollback, the agent may be unloaded; do not repair or kickstart it. Confirm the
+   receipt is still `v0.3.0`, retain the updater log, and record the cert fingerprint before
+   publishing the recovery:
 
-2. Publish signed, notarized `v0.3.1` and mark it latest. Its source and packaged plist must restore
-   `StartInterval` to 86400, and its updater script must restore 0-900 seconds of jitter.
+   ```bash
+   openssl x509 \
+     -in ~/Library/Application\ Support/browser-print-agentd/cert.pem \
+     -noout -fingerprint -sha1
+   ```
+
+2. Publish signed, notarized `v0.3.2` and mark it latest. Its source and packaged plist must use
+   `StartInterval` 86400, and its updater script must use 0-900 seconds of jitter. Its
+   `postinstall` must skip `security add-trusted-cert` when a normal no-`-k` HTTPS request already
+   validates the reused station cert.
 
 3. Do not run `kickstart` or install the successor manually. Note its publication time, then watch
    the updater log:
@@ -248,17 +265,24 @@ without a manual kickstart, then leave the station running the production cadenc
    Expect the next scheduled check to begin within about 65 seconds. Package download,
    verification, installation, and the post-install health probe can finish later.
 
-4. After the log records `updated`, confirm both the receipt and running agent report the new
-   version. Confirm `/health` reports the update outcome and latest version:
+4. After the log records `updated`, confirm both the receipt and running agent report `v0.3.2`.
+   Confirm `/health` reports the update outcome and latest version, and confirm the cert
+   fingerprint is unchanged:
 
    ```bash
    pkgutil --pkg-info io.github.sharaf-nassar.browser-print-agentd
    curl -fsS http://127.0.0.1:9100/health
    sudo cat /Library/Application\ Support/browser-print-agentd/updater/last-run.txt
+   openssl x509 \
+     -in ~/Library/Application\ Support/browser-print-agentd/cert.pem \
+     -noout -fingerprint -sha1
    ```
 
+   The postinstall log must say existing trust was valid and the System keychain was left
+   unchanged. No authorization dialog may appear.
+
 5. The automatic install replaces the plist on disk but does not boot out the loaded `v0.3.0`
-   updater that invoked it. After the log records the completed `v0.3.1` update and the updater
+   updater that invoked it. After the log records the completed `v0.3.2` update and the updater
    exits, prove the on-disk/loaded distinction:
 
    ```bash
@@ -974,9 +998,10 @@ exercised rather than bypassed.
 - [ ] `preinstall` reports Zebra Browser Print removed; afterwards `/Applications`,
       `/Library/LaunchAgents`, `/Library/LaunchDaemons`, and `pkgutil --pkgs` hold nothing Zebra,
       and ports 9100/9101 are free before the payload lands.
-- [ ] `postinstall` generates and trusts the cert, bootstraps the job, and its own `/available`
-      probe passes, so the install exits 0 — with **no GUI authorization dialog and no
-      administrator password prompt**, which is what makes an unattended install viable.
+- [ ] `postinstall` generates the cert, bootstraps the job, proves both listeners, and either
+      verifies existing trust or adds and verifies first-install trust. The install exits 0 with
+      **no GUI authorization dialog and no administrator password prompt**, which is what makes an
+      unattended install viable.
 - [ ] `curl http://127.0.0.1:9100/health` reports the version you just installed, and
       `X-Print-Agent-Version` carries the same string.
 - [ ] Repeat the install after a cold boot on an Apple-Silicon station that has never run this

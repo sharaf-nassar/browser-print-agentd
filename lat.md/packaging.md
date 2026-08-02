@@ -184,15 +184,17 @@ per-user LaunchAgent with no egress or update routes.
 
 `${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load and every 86400 seconds,
 with 0-900 seconds (up to 15 minutes) of script-level jitter. The `v0.3.0` release-validation
-baseline temporarily used a 60-second interval and 0-5 seconds of jitter; `v0.3.1` restores these
-production values. It has no `KeepAlive`. Every check therefore starts from the script currently
-on disk, and `postinstall` never boots out an already registered updater: a package replacement
-cannot kill the process that invoked `installer`. Consequently, automatic installation of
-`v0.3.1` replaces the plist but the loaded `v0.3.0` job retains its 60-second interval until a
-reboot or explicit system-domain bootout/bootstrap. Bootstrap happens only after the print
-agent's own health probe, preserves launchd's disabled override, and uses an install marker plus
-the updater's `installer`-process check to prevent the RunAtLoad execution from nesting inside the
-package installation that registered it.
+baseline temporarily used a 60-second interval and 0-5 seconds of jitter. `v0.3.1` carried the
+production values but its unconditional trust mutation failed in the noninteractive updater;
+`v0.3.2` is the idempotent-trust recovery release and retains those production values. It has no
+`KeepAlive`. Every check therefore starts from the script currently on disk, and `postinstall`
+never boots out an already registered updater: a package replacement cannot kill the process
+that invoked `installer`. Consequently, automatic installation of `v0.3.2` replaces the plist
+but the loaded `v0.3.0` job retains its 60-second interval until a reboot or explicit
+system-domain bootout/bootstrap. Bootstrap happens only after the print agent's own health probe,
+preserves launchd's disabled override, and uses an install marker plus the updater's
+`installer`-process check to prevent the RunAtLoad execution from nesting inside the package
+installation that registered it.
 
 The system support directory is root-owned mode 755 solely to provide traversal to one sanitized,
 root-owned mode-644 status file. Its `updater/` child remains mode 700 and holds the detailed
@@ -223,15 +225,16 @@ a station that cannot be cleaned fails before the payload lands.
 `serverAuth`, 730 days — inside Apple's 825-day trust ceiling), reusing an existing pair unless it
 is within 30 days of expiry so a reinstall does not churn trust for nothing. The recipe drives
 OpenSSL through a config file and must not be rewritten to use `-addext`, because the station's
-`/usr/bin/openssl` is LibreSSL. Trust goes into the **System** keychain via
-`security add-trusted-cert -d -r trustRoot -p ssl`: machine-wide, admin-owned, and restricted to
-TLS evaluation. It happens here, under root, precisely because operators may not have admin
-rights. Since the agent starts `:9101` only when the pair exists, a failed cert step degrades to
-"Safari cannot reach the agent", which a caller can detect, rather than to a silent break. The
-script then bootstraps the job into `gui/<uid>` for the console user (or `${TARGET_USER_ENV}` for
-an unattended install) so the station prints without a logout, and finally polls
-`http://127.0.0.1:9100/available`. A failed probe **fails the install**: reporting success while
-the agent is dead is the exact phantom success this agent exists to kill.
+`/usr/bin/openssl` is LibreSSL. The script bootstraps the job into `gui/<uid>` for the console user
+(or `${TARGET_USER_ENV}` for an unattended install), proves the HTTP endpoint, then waits for the
+HTTPS listener with a bounded `curl -k`. Only after listener readiness does a normal
+`https://localhost:9101/available` request test actual SecureTransport trust. Success leaves the
+**System** keychain unchanged, making reinstall, rollback, and background update idempotent. Failure
+runs `security add-trusted-cert -d -r trustRoot -p ssl` — machine-wide, admin-owned, and restricted
+to TLS evaluation — then requires the same normal request to pass. This behavioral check avoids
+localized trust-setting output and `security verify-cert`. A failed HTTP, HTTPS-readiness, or
+normal trust probe **fails the install**: reporting success while either browser path is dead is
+the exact phantom success this agent exists to kill.
 
 ### Migration Is Not Automatic
 
