@@ -740,6 +740,13 @@ exercised rather than bypassed.
       administrator password prompt**, which is what makes an unattended install viable.
 - [ ] `curl http://127.0.0.1:9100/health` reports the version you just installed, and
       `X-Print-Agent-Version` carries the same string.
+- [ ] Repeat the install after a cold boot on an Apple-Silicon station that has never run this
+      agent. Confirm no prior receipt, certificate, support directory, or launchd job exists,
+      then verify the same install and first-launch results above.
+
+> **Deferred:** the cold-boot first-install check requires an authorized, unused Apple-Silicon
+> station and administrator access. No such station was available for this validation pass, so
+> the successful upgrade and reinstall observations do not count as this proof.
 
 ### 2. Print a real label with Zebra absent
 
@@ -759,6 +766,12 @@ With both printers healthy and the USB one pinned by the caller:
       — never a phantom "Sent" — and `lpstat -o` shows no job was spooled. Prove this twice: once
       with the queue `cupsdisable`d and once with it `cupsenable`d but `cupsreject`ed, since the
       second case is the one only the `lpstat -a` probe catches.
+
+> **Deferred:** the paused-USB-to-network direction requires an authorized Apple-Silicon station
+> with a USB ZD621 and a second healthy network printer. No second printer or authorized
+> queue-control session was available for this validation pass. Do not infer a pass from the
+> automated failover tests: the required result remains a real label, HTTP 200, and the explicit
+> fallback log line. Any phantom "Sent" is a hard failure.
 
 ### 4. Safari certificate path
 
@@ -784,9 +797,16 @@ With two USB Zebras attached to one station:
 ### 6. Sleep, wake, logout, reboot, crash
 
 - [ ] Sleep the Mac, wake it, print. It prints with no manual restart.
+- [ ] Change the station's active network, wait for CUPS to rediscover its network queues, then
+      print. `/available` recovers and the next job prints with no agent restart.
 - [ ] Log out and back in; the agent is running again (`RunAtLoad`).
 - [ ] Reboot; same.
 - [ ] `kill -9` the agent process; `KeepAlive` brings it back within ~10 s and printing works.
+
+> **Deferred:** sleep/wake and network-change recovery require an authorized operator to change
+> station power and network state while a real USB ZD621 is available. This validation pass had
+> neither an authorized station session nor permission for those disruptive transitions, so the
+> existing reboot and crash-recovery observations do not close these checks.
 
 If the `kill -9` bullet fails with `pended nondemand spawn`, do not go looking for a plist fix —
 that is the launchd on-demand gate, and
@@ -816,6 +836,11 @@ reproduce.
 The uid is a hash of the raw device URI, so it is stable as long as the URI is. If the observed uid
 changed, capture both `lpstat -v` outputs — the URI itself changed across re-enumeration, and that
 is a design-level finding, not a station problem.
+
+> **Deferred:** this check requires physical access and authorization to unplug a real USB ZD621
+> from an Apple-Silicon station. Neither was available for this validation pass. The uid remains
+> unproven across real re-enumeration; if it changes, record the before/after URI behavior as a
+> `stableUID` design finding rather than treating it as a station quirk.
 
 ### 9. Wedged USB device still answers inside 1500 ms
 
