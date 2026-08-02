@@ -358,11 +358,12 @@ if [ -z "$CONSOLE_USER" ]; then
 	exit 0
 fi
 
-# Spread requests from stations installed at the same time without keeping a
-# persistent daemon. The upper bound is short relative to the daily interval.
+# Temporarily spread release-validation requests across 0-5 seconds without
+# keeping a persistent daemon. Restore the production 0-900-second range when
+# StartInterval returns to 86400 seconds.
 jitter_seed="$(printf '%s:%s:%s\n' "$(/bin/date +%s)" "$$" "$(/bin/hostname)" |
 	/usr/bin/cksum | /usr/bin/awk '{print $1}')"
-jitter=$((jitter_seed % 901))
+jitter=$((jitter_seed % 6))
 log "scheduled check; delaying $jitter seconds for jitter"
 /bin/sleep "$jitter"
 
