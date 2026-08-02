@@ -22,8 +22,10 @@ then install the pending macOS update and reboot, because
 
 Three things are deliberately out of scope. There is no build-from-source or side-load path,
 because the agent ships only as a signed, notarized `.pkg` attached to a `vX.Y.Z` release and
-nothing on a station auto-updates — every version change is an admin installing a specific package
-on purpose, which is what makes the rollback below one command. Nothing CI already proves is
+nothing on a station auto-updates today — every version change is an admin installing a specific
+package on purpose, which is what makes the rollback below one command;
+[[operations#Station Operations#Auto-Update Decision]] records the adopted successor to that
+shipping posture. Nothing CI already proves is
 repeated as an operator step. And no individual station's evidence trail is kept here.
 
 ## Migrating From A Predecessor Agent
@@ -79,11 +81,98 @@ checklist below. Whether that hardware half has been run yet is a status that ch
 design fact, so the runbook's rollback note is its single home and this section does not restate
 it — consistent with
 [[operations#Station Operations#Station Validation Checklist#The Checklist Is Not A Run Log|the graph carrying no run results]],
-running item 11 updates that one note and nothing here. Nothing auto-updates, so a rolled-back
-station stays put until an admin installs a newer package by hand — the last step is to pin it and
-file the defect against the bad release.
+running item 11 updates that one note and nothing here. Nothing auto-updates in the shipping
+build — [[operations#Station Operations#Auto-Update Decision|the adopted updater]] is not yet
+implemented — so a rolled-back station stays put until an admin installs a newer package by
+hand, and the last step is to pin it and file the defect against the bad release.
 Rolling back to a version that shipped under a *different* product name is not a rollback at all
 but a migration in the other direction, and it meets the same port-freedom hard failure.
+
+## Auto-Update Decision
+
+Auto-update is adopted but not yet implemented: a separate root updater will keep stations
+current while the agent itself never updates itself. Until the updater ships, the manual-install
+posture above stays true of every station.
+
+The decision (beads issue `zebra-mac-agent-egp`) splits the product in two. The agent stays
+exactly as it is — an unprivileged LaunchAgent, loopback-only, zero outbound network, no update
+routes — and updating becomes the job of a separate root daemon. The frozen wire contract, the
+`Device` shape, and the no-downgrade-guard install-over-install path of
+[[operations#Station Operations#Rollback Path]] are all untouched, and pinning a station stays one
+command: `sudo launchctl disable system/<updater-label>`. Implementation is phased and tracked in
+beads — phase 1 the release-side manifest and checksum assets, phase 2 the updater daemon plus
+the runbook updates, phase 3 the `/health` update visibility — and `RUNBOOK.md` changes only when
+the updater ships, because it describes shipping behavior alone.
+
+### The Adopted Updater Shape
+
+A short-lived root updater script, run roughly daily by its own system-domain LaunchDaemon,
+downloads, verifies, and installs the release the published manifest names, then proves the
+install with a health probe or rolls it back.
+
+The updater is a POSIX shell script shipped as a `packaging/*.in` template rendered from
+`packaging/identity.sh` — the same convention as `launcher.sh.in`
+([[packaging#Packaging#Packaging Identity#Rendered Packaging Templates]]) — installed under
+`libexec/` and run by its own root LaunchDaemon label in the system domain with `RunAtLoad` plus
+a `StartInterval` of roughly a day with jitter. Short-lived runs mean each execution is a fresh
+exec of whatever is on disk, so the classic self-update race — a postinstall booting out the
+process that spawned `installer` — cannot occur, and
+[[packaging#Packaging#Station Installer#The launchd On-Demand Gate]] does not apply to it, being
+a `gui`-domain condition on a job the system domain never sees.
+
+Each run skips unless a console user is present, because `postinstall` requires one. Otherwise it
+fetches a small `update-manifest.txt` (version, asset name, sha256) from the stable
+`releases/latest/download/…` URL and compares against the installed receipt via
+`pkgutil --pkg-info`. The manifest is the truth: it installs whenever the manifest version
+*differs* from the installed one, not only when it is newer — so yanking a bad release (marking
+it prerelease on GitHub) automatically rolls the fleet back to the previous good build, turning
+[[infrastructure#Infrastructure#Release Chain#Asset Retention]] into a fleet-healing mechanism.
+
+Verification is explicit, because a CLI `installer` bypasses Gatekeeper entirely. The sha256 from
+the manifest is the primary gate. `pkgutil --check-signature` checks the Developer ID Team ID,
+pinned at runtime from the `codesign` info of the currently installed binary — trust on first
+install, so no Team ID string ever lands in this repository and
+[[infrastructure#Infrastructure#Naming Gate|the naming gate]] stays clean. And the updater sets
+`com.apple.quarantine` on the downloaded package explicitly and requires
+`spctl --assess --type install` to report Notarized Developer ID — reproducing the release
+chain's own quarantine-bit-set assessment
+([[infrastructure#Infrastructure#Release Chain#Signing Chain Facts]]), so the update channel
+never weakens the Gatekeeper contract.
+
+Install is `installer -pkg … -target /` with the rendered target-user environment variable set to
+the console user. Afterwards the updater probes `GET /health` until `X-Print-Agent-Version`
+matches the manifest ([[tools#Print Agent#Version And Health Surface]]); on failure it reinstalls
+the cached previous `.pkg`, kept from the last good update, and quarantines the failed version in
+a state file so it is never retried. It logs to `/Library/Logs/<product>/update.log`.
+
+Observability keeps the agent at zero egress: the updater writes a status file, and `/health` —
+an additive diagnostics surface, not part of the frozen wire contract — may later expose update
+status read from that file. The frozen `Device` object is untouched. On the release side the
+tag-only trigger ([[infrastructure#Infrastructure#Release Chain#Trigger Surface]]) is preserved:
+each release additionally uploads `<pkg>.sha256` and `update-manifest.txt` as assets and marks
+the release `--latest` explicitly.
+
+### Rejected Alternatives
+
+Five other update stories were considered and rejected, each on a property this product cannot
+give up. Recording them is part of the decision itself.
+
+**Staying manual-only** scales with station count and depends on someone noticing a station is
+behind; a station can sit on a defective build indefinitely.
+
+**Sparkle** requires an `.app` bundle the product does not have, and Sparkle's own documentation
+states that package installs always require user authorization — silent daemon updates are
+impossible with it.
+
+**The agent updating itself** fails on privilege and on exposure: the agent is unprivileged, and
+an updater inside it would bolt the product's first outbound network path plus a
+web-page-reachable trigger onto an unauthenticated loopback service.
+
+**MDM- or Munki-only management** assumes managed stations, and these stations are unmanaged;
+a managed fleet instead gets the one-command pin as its opt-out.
+
+**Polling the GitHub REST API** costs 60 requests per hour shared across a NAT IP and a
+JSON-parsing dependency; the `releases/latest/download` redirect needs neither.
 
 ## Station Validation Checklist
 
