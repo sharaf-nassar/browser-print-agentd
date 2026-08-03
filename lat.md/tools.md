@@ -13,17 +13,25 @@ report phantom success.
 `POST /read` and the `OPTIONS` preflight in exactly the shapes the calling transport parses,
 echoing the request `Origin` back as `Access-Control-Allow-Origin`. Two additive routes sit beside
 them: `GET /health` and `POST /print-pdf` ([[tools#Print Agent#Document Printing]]).
-The preflight carries one header beyond ordinary CORS, and it is what makes the agent reachable
-from a Chromium station at all. Chromium classifies loopback as the most private address space,
-so a public https page fetching `localhost` is a Private Network Access request: it is
-preflighted even when it is a simple `GET` that ordinary CORS would send bare, and the real
-request is dropped unless the response echoes `Access-Control-Allow-Private-Network: true`. The
-agent answers that grant only when the preflight asks for it, and only for an origin
-`[[server.go#agent#originAllowed]]` would admit — an origin refused at `/write` must not collect
-a private-network grant on the way in. Omitting it does not degrade a station, it strands one:
-the SPA's probe never leaves the browser, the agent reads as unreachable while it is running
-perfectly, and the SPA's macOS gate blocks printing outright. The signature in the request log is
-paired `OPTIONS` entries with no `GET` behind them.
+`Access-Control-Allow-Headers: Content-Type` is the narrowest surface here and the one that
+decides whether a caller reaches the agent at all. A probe carrying any other header — a tracing
+SDK's `sentry-trace`, an auth token, anything a fetch wrapper adds — stops being a simple request,
+so the browser preflights it and this list refuses it. The caller sees a rejected fetch, which is
+indistinguishable from a daemon that is not installed, so a station running perfectly reads as
+unreachable and its SPA blocks printing outright. That is not hypothetical: it took down a
+station on 2026-08-03, and the only tell was this daemon's own request log showing paired
+`OPTIONS` entries with no `GET` behind them. Calling code owns that constraint — the contract is
+frozen and the fix belongs upstream — but this is the surface that enforces it, so widening or
+narrowing the list is a station-visible change.
+
+The preflight also answers `Access-Control-Allow-Private-Network: true`, gated on the same
+`[[server.go#agent#originAllowed]]` posture so an origin refused at `/write` cannot collect a
+private-network grant on the way in. It is a correct Private Network Access grant and it is kept,
+but it is **not** load-bearing and no station depends on it. It was added against a misdiagnosis
+of the outage above; Chrome 142 replaced Private Network Access with Local Network Access, which
+gates on a permission "rather than via preflight requests", and the Chrome 150 preflight that
+stranded the station carried no `Access-Control-Request-Private-Network` header at all. It earns
+its place only for a PNA-era client that still asks.
 
 `[[discovery.go#printer#device]]` shapes each wire `Device`; only `name` and `uid` are
 load-bearing, and `provider` reports `browser-print-agentd`. Ports and bind address come from

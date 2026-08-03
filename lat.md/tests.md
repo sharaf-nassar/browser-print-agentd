@@ -225,16 +225,17 @@ which the browser blocks `/write` outright.
 
 ### Private Network Preflight Grant
 
-Verifies the Private Network Access grant that lets a Chromium station reach the agent at all:
-returned when the preflight asks for it, absent when it does not, and governed by the origin
-allowlist once one is configured.
+Verifies the Private Network Access grant: returned when the preflight asks for it, absent when
+it does not, and governed by the origin allowlist once one is configured.
 
-Chromium preflights every public-page-to-loopback request and drops the real request unless the
-response echoes `Access-Control-Allow-Private-Network: true`. Without the grant the SPA's
-`GET /available` never leaves the browser, so a station whose agent is running perfectly reads as
-unreachable. The unasked case is pinned so the header is not sprayed onto ordinary preflights,
-and the allowlist case is pinned because an origin refused at `/write` must not collect a
-private-network grant here.
+The unasked case is pinned so the header is not sprayed onto ordinary preflights, and the
+allowlist case is pinned because an origin refused at `/write` must not collect a private-network
+grant here. What this does **not** pin is a station working, and the distinction is worth keeping
+straight: the grant was written against a misdiagnosed outage
+([[tools#Print Agent]]), and no station is known to need it. Chrome 142
+moved to Local Network Access, which gates on a permission rather than a preflight, so a current
+Chromium sends no `Access-Control-Request-Private-Network` at all and never reaches the branch
+under test. These assertions guard a PNA-era client that still asks, and nothing more.
 
 ### Read And Unknown Routes
 
