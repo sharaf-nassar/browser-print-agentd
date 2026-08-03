@@ -223,6 +223,19 @@ Verifies the `OPTIONS` preflight answers 204 with the request `Origin` echoed ba
 allowed methods and headers, and that a request with no `Origin` gets the wildcard — without
 which the browser blocks `/write` outright.
 
+### Private Network Preflight Grant
+
+Verifies the Private Network Access grant that lets a Chromium station reach the agent at all:
+returned when the preflight asks for it, absent when it does not, and governed by the origin
+allowlist once one is configured.
+
+Chromium preflights every public-page-to-loopback request and drops the real request unless the
+response echoes `Access-Control-Allow-Private-Network: true`. Without the grant the SPA's
+`GET /available` never leaves the browser, so a station whose agent is running perfectly reads as
+unreachable. The unasked case is pinned so the header is not sprayed onto ordinary preflights,
+and the allowlist case is pinned because an origin refused at `/write` must not collect a
+private-network grant here.
+
 ### Read And Unknown Routes
 
 Verifies `POST /read` answers 200 with an empty body for parity with the vendor daemon, and that

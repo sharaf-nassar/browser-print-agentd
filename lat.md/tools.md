@@ -13,6 +13,18 @@ report phantom success.
 `POST /read` and the `OPTIONS` preflight in exactly the shapes the calling transport parses,
 echoing the request `Origin` back as `Access-Control-Allow-Origin`. Two additive routes sit beside
 them: `GET /health` and `POST /print-pdf` ([[tools#Print Agent#Document Printing]]).
+The preflight carries one header beyond ordinary CORS, and it is what makes the agent reachable
+from a Chromium station at all. Chromium classifies loopback as the most private address space,
+so a public https page fetching `localhost` is a Private Network Access request: it is
+preflighted even when it is a simple `GET` that ordinary CORS would send bare, and the real
+request is dropped unless the response echoes `Access-Control-Allow-Private-Network: true`. The
+agent answers that grant only when the preflight asks for it, and only for an origin
+`[[server.go#agent#originAllowed]]` would admit — an origin refused at `/write` must not collect
+a private-network grant on the way in. Omitting it does not degrade a station, it strands one:
+the SPA's probe never leaves the browser, the agent reads as unreachable while it is running
+perfectly, and the SPA's macOS gate blocks printing outright. The signature in the request log is
+paired `OPTIONS` entries with no `GET` behind them.
+
 `[[discovery.go#printer#device]]` shapes each wire `Device`; only `name` and `uid` are
 load-bearing, and `provider` reports `browser-print-agentd`. Ports and bind address come from
 `[[config.go#parseConfig]]` — flag over environment over default — and there is no hand-listed

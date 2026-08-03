@@ -1478,6 +1478,58 @@ func TestCORSEchoesOriginAndAnswersPreflight(t *testing.T) {
 	}
 }
 
+// @lat: [[tests#Agent Core#Private Network Preflight Grant]]
+func TestPrivateNetworkPreflightGrant(t *testing.T) {
+	preflight := func(t *testing.T, base, origin string, ask bool) http.Header {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodOptions, base+"/available", nil)
+		if err != nil {
+			t.Fatalf("build preflight: %v", err)
+		}
+		request.Header.Set("Origin", origin)
+		if ask {
+			request.Header.Set("Access-Control-Request-Private-Network", "true")
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("preflight: %v", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("preflight status = %d, want 204", response.StatusCode)
+		}
+		return response.Header
+	}
+
+	open, _ := startAgent(t, twoPrinterCUPS(stateEnabled, stateEnabled), nil)
+
+	// A Chromium preflight that asks gets the grant, without which the browser
+	// drops the GET that follows and the station reads as unreachable.
+	header := preflight(t, open, "https://lab.example", true)
+	if got := header.Get("Access-Control-Allow-Private-Network"); got != "true" {
+		t.Fatalf("Allow-Private-Network = %q, want true", got)
+	}
+
+	// A preflight that never asked is not handed the grant.
+	header = preflight(t, open, "https://lab.example", false)
+	if got := header.Get("Access-Control-Allow-Private-Network"); got != "" {
+		t.Fatalf("unasked Allow-Private-Network = %q, want absent", got)
+	}
+
+	// Once an allowlist is configured it governs the grant too: an origin that
+	// would be refused at /write must not be waved onto the private network.
+	locked, _ := startAgent(t, twoPrinterCUPS(stateEnabled, stateEnabled),
+		[]string{"https://lab.example"})
+	header = preflight(t, locked, "https://evil.example", true)
+	if got := header.Get("Access-Control-Allow-Private-Network"); got != "" {
+		t.Fatalf("disallowed origin Allow-Private-Network = %q, want absent", got)
+	}
+	header = preflight(t, locked, "https://lab.example", true)
+	if got := header.Get("Access-Control-Allow-Private-Network"); got != "true" {
+		t.Fatalf("allowed origin Allow-Private-Network = %q, want true", got)
+	}
+}
+
 // @lat: [[tests#Agent Core#Read And Unknown Routes]]
 func TestReadAndUnknownRoutes(t *testing.T) {
 	base, _ := startAgent(t, twoPrinterCUPS(stateEnabled, stateEnabled), nil)

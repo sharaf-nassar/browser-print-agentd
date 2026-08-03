@@ -109,6 +109,23 @@ func (a *agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(versionHeader, version)
 
 	if r.Method == http.MethodOptions {
+		// Private Network Access. Chromium treats a public https page reaching
+		// loopback as a private network request and preflights EVERY one of
+		// them — including a simple GET that ordinary CORS would never
+		// preflight — carrying Access-Control-Request-Private-Network. It then
+		// drops the real request unless the response grants it back. Without
+		// this header the SPA's GET /available never leaves the browser, the
+		// station reads as "agent unreachable", and the macOS install gate
+		// hard-blocks printing on a station whose agent is running fine. The
+		// log is the tell: paired OPTIONS with no GET behind them.
+		//
+		// Gated on originAllowed so the Q14 posture governs this grant too — an
+		// origin the station would refuse at /write must not be handed a
+		// blanket private-network grant here.
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" &&
+			a.originAllowed(origin) {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		}
 		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(http.StatusNoContent)
 		return
