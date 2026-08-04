@@ -78,6 +78,18 @@ RELEASE_BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases"
 # Build-time artifact names.
 COMPONENT_PKG_NAME="${PRODUCT_NAME}-component.pkg"
 
+# The GUI uninstaller. A payload-free package whose only job is to run the
+# already-installed UNINSTALLER_PATH as root, so a station user can remove the
+# product by opening a file instead of typing a sudo command. Its identifier is
+# distinct from BUNDLE_ID because it is a different package; pkgbuild
+# --nopayload writes no receipt for it, so it leaves nothing of its own behind.
+# The asset name carries no version on purpose: unlike the installer, this
+# package contains no build, so a version in the name would name nothing.
+UNINSTALL_PKG_ID="${BUNDLE_ID}.uninstall"
+UNINSTALL_COMPONENT_PKG_NAME="${PRODUCT_NAME}-uninstall-component.pkg"
+UNINSTALL_PKG_NAME="${PRODUCT_NAME}-uninstall.pkg"
+UNINSTALL_TITLE="Uninstall ${PRODUCT_TITLE}"
+
 # Tag glob that build-pkg.sh derives a default VERSION from. The repo is
 # single-product, so releases are plain vX.Y.Z tags.
 RELEASE_TAG_GLOB="v*"

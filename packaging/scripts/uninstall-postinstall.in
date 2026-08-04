@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# uninstall-postinstall — the entire payload of the GUI uninstaller package.
+#
+# Rendered from packaging/identity.sh and run by Installer as root. It owns no
+# removal logic of its own: __UNINSTALLER_PATH__ is the single implementation of
+# what "uninstalled" means, and it already resolves the station account from
+# /dev/console rather than SUDO_USER, which is exactly the environment a package
+# script runs in. Duplicating any of it here would create a second definition
+# that could drift from the one the command line uses.
+
+set -eu
+
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+PRODUCT="__PRODUCT_NAME__"
+UNINSTALLER="__UNINSTALLER_PATH__"
+
+log() {
+	/usr/bin/logger -t "$PRODUCT-uninstall-pkg" "$1" 2>/dev/null || true
+	printf '[%s uninstall] %s\n' "$PRODUCT" "$1"
+}
+
+# The distribution's installation-check already refused this package when the
+# uninstaller is absent. This is the belt-and-braces case: a check that somehow
+# passed, or a file that lost its executable bit.
+if [ ! -x "$UNINSTALLER" ]; then
+	log "ERROR: $UNINSTALLER is missing or not executable; nothing was removed"
+	exit 1
+fi
+
+log "running $UNINSTALLER"
+
+# exec, not a call: this script has nothing to do afterwards, and the exit code
+# the Installer reports should be the uninstaller's own. A non-zero status means
+# only that a port was still held after removal — the files are gone either way,
+# which is what the RUNBOOK entry for this package explains. Propagating it
+# keeps one meaning for one exit code across the GUI and command-line paths.
+# The uninstaller deletes itself as its last act; on macOS a running script
+# unlinks cleanly.
+exec "$UNINSTALLER"

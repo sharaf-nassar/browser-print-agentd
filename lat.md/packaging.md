@@ -16,7 +16,9 @@ the launchd `Label` and the `productbuild` package identifier), `BINARY_NAME`, `
 `AGENT_PLIST_PATH`, updater script/label/plist paths, public update-status path, root updater support/log paths,
 `SUPPORT_DIR_NAME`, `LOG_DIR_NAME`, `LOG_FILE_NAME`, `ENV_PREFIX`, `TARGET_USER_ENV`,
 `LOG_PATH_ENV`, `TEMP_PREFIX`, the derived
-GitHub release URL, `COMPONENT_PKG_NAME`, and the release-tag glob. Everything but the product
+GitHub release URL, `COMPONENT_PKG_NAME`, the GUI uninstaller's
+`UNINSTALL_PKG_ID`/`UNINSTALL_COMPONENT_PKG_NAME`/`UNINSTALL_PKG_NAME`/`UNINSTALL_TITLE`, and the
+release-tag glob. Everything but the product
 name itself and the reverse-DNS namespace prefix is derived, so a rename is a one-line edit.
 
 The Go half cannot be templated — the binary is compiled, not rendered — so `productName` is
@@ -52,8 +54,12 @@ Every shipped packaging artifact is a `.in` template that `packaging/build-pkg.s
 from the repository.
 
 The template set is `launchagent.plist.in`, `updater.plist.in`, `distribution.xml.in`,
-`launcher.sh.in`, `updater.sh.in`, `uninstall.sh.in`, `scripts/preinstall.in`, and
-`scripts/postinstall.in`. Rendering fills both launchd labels and paths, the `distribution.xml`
+`launcher.sh.in`, `updater.sh.in`, `uninstall.sh.in`, `scripts/preinstall.in`,
+`scripts/postinstall.in`, and the four that make up the GUI uninstaller
+([[packaging#Packaging#Station Installer#Uninstaller#The GUI Uninstaller Package]]):
+`uninstall-distribution.xml.in`, `scripts/uninstall-postinstall.in`, `uninstall-welcome.txt.in`,
+and `uninstall-conclusion.txt.in`. Rendering fills both launchd labels and paths, the
+`distribution.xml`
 `title`/`choice`/`pkg-ref` ids and component package name, installer/uninstaller paths, account and
 root support/log directories, release URL, log-tag prefixes, target-user environment variable,
 and `mktemp` prefixes. Generated plist names derive from their labels rather than carrying
@@ -279,3 +285,38 @@ all is an operations question rather than a packaging one:
 [[operations#Station Operations#Rollback Path|rolling a station back]] does not use it, an upgrade
 does not either, and the one case that requires it first is migrating away to a differently-named
 agent.
+
+#### The GUI Uninstaller Package
+
+A second, payload-free distribution package makes removal a double-click, because the audience that
+needs to remove the product is not always the audience that can be handed a `sudo` command.
+
+`pkgbuild --nopayload` builds a component that is scripts and nothing else, and Apple's documented
+behaviour for that flag is that it writes **no receipt** — so the package that removes the product
+records nothing of its own to remove later. Its `postinstall` owns no removal logic: its body is
+`exec ${UNINSTALLER_PATH}`. That matters more than it looks. The uninstaller already resolves the
+station account from `/dev/console` rather than `SUDO_USER`, which is exactly the environment an
+Installer script runs in, so it needed no change at all to work this way — and there stays exactly
+one implementation of what "uninstalled" means for both the GUI and command-line paths to share.
+
+Three consequences are documented rather than designed around, because Apple's schema fixes them.
+The Installer's primary button is **not** customizable — the full element list offers `title`,
+`welcome`, `readme`, `license`, `conclusion` and `background` and nothing for button text — so the
+button reads "Install" while all three available panes say "remove". `installation-check` refuses
+the package outright when `${UNINSTALLER_PATH}` is absent, so a second run reports "not installed"
+in a real dialog instead of running a script that finds nothing; a failing check must set
+`my.result.type` and `my.result.message`, which are the only two fields the schema documents and so
+the only two set. And the package propagates the uninstaller's own exit code rather than
+normalising it, so the single non-zero case — a port still held after removal — means the same
+thing in both paths; the files are gone either way, which is what
+[[operations#Station Operations]] tells an admin to check.
+
+An `.app` in `/Applications` was rejected for this. `pkgbuild` marks bundles relocatable by default,
+notarizing a script-only bundle is unproven and its fallback is a second Go binary that breaks the
+flat `package main` layout, a rollback would leave an orphan, and a permanent one-click destroy
+button beside the thing it destroys is a hazard a downloaded file is not.
+
+A double hyphen is illegal inside an XML comment, which a distribution file full of tool flag names
+invites. `productbuild` catches it, but only on macOS, so a `STAGE_ONLY=1` run would pass a broken
+file straight to a release: `build-pkg.sh` runs `xmllint --noout` over both distribution files when
+xmllint is present, and says loudly in its log when it is not.

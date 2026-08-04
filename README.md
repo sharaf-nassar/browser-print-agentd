@@ -57,16 +57,26 @@ verifies before installing anything, and how to roll a station back are all in
 
 ## Uninstall
 
-This one does need Terminal:
+**[Download the uninstaller](https://github.com/sharaf-nassar/browser-print-agentd/releases/latest/download/browser-print-agentd-uninstall.pkg)**,
+open it, and follow the prompts.
 
-```bash
-sudo /usr/local/bin/browser-print-agentd-uninstall
-```
+macOS does not let an installer package rename its own button, so it still says "Install" — the
+window text says what is actually happening, and nothing is installed. If the agent is not on this
+Mac, it says so and stops rather than doing anything.
 
 It removes all of it — both launchd jobs and their plists, the binary, the launcher, updater state
 and cache, keychain trust (matched by SHA-1 fingerprint, never by name), the certificate and log
 directories, and the installer receipt. It deletes the log ring too, so copy that directory first
 if you are uninstalling because something was wrong.
+
+The same thing from Terminal, if you prefer:
+
+```bash
+sudo /usr/local/bin/browser-print-agentd-uninstall
+```
+
+Both run exactly the same code — the uninstaller package's only content is a script that calls the
+command above.
 
 ## What the installer does
 

@@ -168,6 +168,14 @@ trap 'rm -rf "$STAGE_DIR"' EXIT
 PAYLOAD_DIR="$STAGE_DIR/payload"
 SCRIPTS_DIR="$STAGE_DIR/scripts"
 COMPONENTS_DIR="$STAGE_DIR/components"
+# The GUI uninstaller is a second, payload-free distribution package built from
+# the same identity and signed with the same identity. It gets its own scripts
+# directory, its own component directory (productbuild consumes a whole
+# package-path, so the two components must not share one), and a resources
+# directory for the welcome and conclusion panes.
+UNINSTALL_SCRIPTS_DIR="$STAGE_DIR/uninstall-scripts"
+UNINSTALL_COMPONENTS_DIR="$STAGE_DIR/uninstall-components"
+UNINSTALL_RESOURCES_DIR="$STAGE_DIR/uninstall-resources"
 
 log "version $VERSION, arch $ARCH ($HOST_ARCHITECTURES), staging in $STAGE_DIR"
 log "identity: $PRODUCT_NAME / $BUNDLE_ID"
@@ -181,7 +189,8 @@ mkdir -p "$PAYLOAD_DIR/usr/local/bin" \
 	"$PAYLOAD_DIR/Library/LaunchAgents" \
 	"$PAYLOAD_DIR/Library/LaunchDaemons" \
 	"$PAYLOAD_DIR$SYSTEM_LOG_DIR" \
-	"$SCRIPTS_DIR" "$COMPONENTS_DIR" "$OUTPUT_DIR"
+	"$SCRIPTS_DIR" "$COMPONENTS_DIR" "$OUTPUT_DIR" \
+	"$UNINSTALL_SCRIPTS_DIR" "$UNINSTALL_COMPONENTS_DIR" "$UNINSTALL_RESOURCES_DIR"
 
 log "building $BINARY_NAME for darwin/$ARCH"
 # An array rather than an unquoted expansion, so a multi-word GO_LDFLAGS reaches
@@ -245,6 +254,10 @@ render_template() {
 		-e "s|__RELEASE_REPOSITORY__|$RELEASE_REPOSITORY|g" \
 		-e "s|__RELEASE_BASE_URL__|$RELEASE_BASE_URL|g" \
 		-e "s|__COMPONENT_PKG_NAME__|$COMPONENT_PKG_NAME|g" \
+		-e "s|__UNINSTALL_PKG_ID__|$UNINSTALL_PKG_ID|g" \
+		-e "s|__UNINSTALL_COMPONENT_PKG_NAME__|$UNINSTALL_COMPONENT_PKG_NAME|g" \
+		-e "s|__UNINSTALL_PKG_NAME__|$UNINSTALL_PKG_NAME|g" \
+		-e "s|__UNINSTALL_TITLE__|$UNINSTALL_TITLE|g" \
 		-e "s|__HOST_ARCHITECTURES__|$HOST_ARCHITECTURES|g" \
 		"$src" >"$dest"
 	chmod "$mode" "$dest"
@@ -271,21 +284,47 @@ render_template "$PACKAGING_DIR/updater.plist.in" \
 render_template "$PACKAGING_DIR/scripts/preinstall.in" "$SCRIPTS_DIR/preinstall" 755
 render_template "$PACKAGING_DIR/scripts/postinstall.in" "$SCRIPTS_DIR/postinstall" 755
 render_template "$PACKAGING_DIR/distribution.xml.in" "$STAGE_DIR/distribution.xml" 644
+render_template "$PACKAGING_DIR/scripts/uninstall-postinstall.in" \
+	"$UNINSTALL_SCRIPTS_DIR/postinstall" 755
+render_template "$PACKAGING_DIR/uninstall-distribution.xml.in" \
+	"$STAGE_DIR/uninstall-distribution.xml" 644
+render_template "$PACKAGING_DIR/uninstall-welcome.txt.in" \
+	"$UNINSTALL_RESOURCES_DIR/welcome.txt" 644
+render_template "$PACKAGING_DIR/uninstall-conclusion.txt.in" \
+	"$UNINSTALL_RESOURCES_DIR/conclusion.txt" 644
 chmod 755 "$PAYLOAD_DIR$BINARY_PATH"
 find "$PAYLOAD_DIR" -type d -exec chmod 755 {} +
 
 # Belt and braces over the whole staged tree, not just the files rendered above:
 # a template that is added later and copied by hand would otherwise slip through.
-unrendered="$(grep -rIln '__[A-Z][A-Z0-9_]*__' "$PAYLOAD_DIR" "$SCRIPTS_DIR" "$STAGE_DIR/distribution.xml" 2>/dev/null || true)"
+unrendered="$(grep -rIln '__[A-Z][A-Z0-9_]*__' "$PAYLOAD_DIR" "$SCRIPTS_DIR" \
+	"$UNINSTALL_SCRIPTS_DIR" "$UNINSTALL_RESOURCES_DIR" \
+	"$STAGE_DIR/distribution.xml" "$STAGE_DIR/uninstall-distribution.xml" 2>/dev/null || true)"
 if [ -n "$unrendered" ]; then
 	printf '%s\n' "$unrendered" >&2
 	fail "the staged tree contains unrendered placeholders in the files listed above"
+fi
+
+# productbuild rejects a malformed distribution file, but only on macOS — a
+# --stage-only run on Linux CI would otherwise pass a broken one straight
+# through to the release. The cheap failure this catches is real: a double
+# hyphen inside an XML comment is illegal, and flag names are full of them.
+if command -v xmllint >/dev/null 2>&1; then
+	for dist in "$STAGE_DIR/distribution.xml" "$STAGE_DIR/uninstall-distribution.xml"; do
+		xmllint --noout "$dist" || fail "$dist is not well-formed XML"
+	done
+	log "distribution files are well-formed XML"
+else
+	log "WARNING: xmllint not found; distribution XML was NOT validated here"
 fi
 
 log "staged payload:"
 (cd "$PAYLOAD_DIR" && find . -type f -exec ls -l {} \; | sed 's/^/    /')
 log "staged scripts:"
 (cd "$SCRIPTS_DIR" && find . -type f -exec ls -l {} \; | sed 's/^/    /')
+log "staged uninstaller scripts and resources:"
+(cd "$UNINSTALL_SCRIPTS_DIR" && find . -type f -exec ls -l {} \; | sed 's/^/    /')
+(cd "$UNINSTALL_RESOURCES_DIR" && find . -type f -exec ls -l {} \; | sed 's/^/    /')
 
 if [ "$STAGE_ONLY" = "1" ]; then
 	# Copy the staged tree out before the EXIT trap deletes it, so a CI job can
@@ -293,7 +332,9 @@ if [ "$STAGE_ONLY" = "1" ]; then
 	staged_copy="$OUTPUT_DIR/stage-$VERSION-$ARCH"
 	rm -rf "$staged_copy"
 	mkdir -p "$staged_copy"
-	cp -R "$PAYLOAD_DIR" "$SCRIPTS_DIR" "$STAGE_DIR/distribution.xml" "$staged_copy/"
+	cp -R "$PAYLOAD_DIR" "$SCRIPTS_DIR" "$STAGE_DIR/distribution.xml" \
+		"$UNINSTALL_SCRIPTS_DIR" "$UNINSTALL_RESOURCES_DIR" \
+		"$STAGE_DIR/uninstall-distribution.xml" "$staged_copy/"
 	log "stage-only run complete: $staged_copy"
 	exit 0
 fi
@@ -357,3 +398,46 @@ else
 fi
 
 log "built $final_pkg"
+
+# ---------------------------------------------------------------------------
+# 6. The GUI uninstaller package
+# ---------------------------------------------------------------------------
+#
+# Payload-free: --nopayload builds a component that is scripts and nothing else,
+# and deliberately leaves no receipt in the pkgutil database (Apple's documented
+# behaviour for the flag). So opening this package removes the product without
+# recording that anything was ever installed to remove it.
+#
+# It carries no binary, which is why there is no codesign step here and no
+# hostArchitectures in its distribution: the only thing to sign is the package
+# itself, by the same Developer ID Installer identity as the installer.
+
+log "building the uninstaller component package"
+pkgbuild \
+	--nopayload \
+	--scripts "$UNINSTALL_SCRIPTS_DIR" \
+	--identifier "$UNINSTALL_PKG_ID" \
+	--version "$VERSION" \
+	"$UNINSTALL_COMPONENTS_DIR/$UNINSTALL_COMPONENT_PKG_NAME"
+
+unsigned_uninstall_pkg="$STAGE_DIR/$UNINSTALL_PKG_NAME"
+log "building the uninstaller distribution package"
+productbuild \
+	--distribution "$STAGE_DIR/uninstall-distribution.xml" \
+	--package-path "$UNINSTALL_COMPONENTS_DIR" \
+	--resources "$UNINSTALL_RESOURCES_DIR" \
+	"$unsigned_uninstall_pkg"
+
+if [ -n "$INSTALLER_SIGNING_IDENTITY" ]; then
+	final_uninstall_pkg="$OUTPUT_DIR/$UNINSTALL_PKG_NAME"
+	log "productsigning the uninstaller package"
+	productsign --sign "$INSTALLER_SIGNING_IDENTITY" \
+		"$unsigned_uninstall_pkg" "$final_uninstall_pkg"
+	pkgutil --check-signature "$final_uninstall_pkg"
+else
+	final_uninstall_pkg="$OUTPUT_DIR/${UNINSTALL_PKG_NAME%.pkg}-unsigned.pkg"
+	cp "$unsigned_uninstall_pkg" "$final_uninstall_pkg"
+	log "no --installer-identity given: the uninstaller package is UNSIGNED."
+fi
+
+log "built $final_uninstall_pkg"

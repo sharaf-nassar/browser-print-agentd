@@ -42,6 +42,10 @@ The two files are byte-identical; only the asset name differs. Use the versioned
 anything where the build matters — installs you are recording, rollbacks, incident forensics. The
 evergreen copy exists for the download link described below.
 
+Each release also carries `browser-print-agentd-uninstall.pkg`, the double-clickable uninstaller —
+version-free for the same reason the evergreen copy is, since it contains no build. See
+[The GUI uninstaller package](#the-gui-uninstaller-package).
+
 Four properties hold, and the release workflow enforces them rather than relying on convention:
 
 - **The version is in the filename.** The workflow asserts the versioned asset is exactly
@@ -80,7 +84,7 @@ Consequences worth knowing before you touch a release:
 
 - **`releases/latest` excludes drafts and prereleases.** A release left in draft, or marked as a
   prerelease, is invisible to the link — it will keep resolving to the previous release. The
-  workflow marks a release `--latest` explicitly, and only after all four assets are attached, so
+  workflow marks a release `--latest` explicitly, and only after all five assets are attached, so
   the link never resolves to a release that is still missing its installer.
 - **Hand-editing a release can break the link.** Deleting the evergreen asset from the newest
   release, or unmarking that release as latest, breaks it without breaking anything else you
@@ -648,7 +652,34 @@ fingerprint, never by name), agent/updater logs, and installer receipt — then 
 sudo browser-print-agentd-uninstall          # add --user <account> on a multi-account station
 ```
 
-Two flags matter:
+### The GUI uninstaller package
+
+For a station whose user is not an admin and has no business in a terminal, each release also
+attaches `browser-print-agentd-uninstall.pkg`, reachable at a permanent link:
+
+```text
+https://github.com/sharaf-nassar/browser-print-agentd/releases/latest/download/browser-print-agentd-uninstall.pkg
+```
+
+It is payload-free: `pkgbuild --nopayload`, one `postinstall` script, and that script's entire body
+is `exec /usr/local/bin/browser-print-agentd-uninstall`. There is exactly one implementation of what
+"uninstalled" means and both paths run it, so the two can never drift. It is signed, notarized and
+stapled by the same chain as the installer.
+
+Three things to know before you hand it to someone:
+
+- **The button says "Install".** Apple's distribution schema has no element for button text — only
+  the title, welcome and conclusion panes are customizable, and all three say "remove". Nothing is
+  installed, and `pkgbuild --nopayload` writes **no receipt**, so the uninstaller leaves no trace of
+  itself.
+- **Run on a Mac without the agent, it refuses.** The distribution's `installation-check` tests for
+  the installed uninstaller and stops with "not installed on this Mac" rather than running.
+- **If Installer reports a failure, the removal still happened.** The package propagates the
+  uninstaller's own exit code, and the only non-zero case is port 9100 or 9101 still being held
+  after removal — the files are gone regardless. Check with the `lsof` commands below; something
+  else on the Mac is holding the port.
+
+Two flags matter (command line only — the package takes no options):
 
 - `--user <account>` operates on that account rather than the console user. Cert and log paths are
   per-account, so a station with more than one printing account needs **one run per account**. Run
