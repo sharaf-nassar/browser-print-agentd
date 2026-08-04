@@ -190,7 +190,11 @@ per-user LaunchAgent with no egress or update routes.
 `${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load and hourly on the hour, via
 a `StartCalendarInterval` of `Minute 0` rather than a `StartInterval`, with 0-300 seconds (up to 5
 minutes) of script-level jitter. The calendar key is what makes a sleeping station recover: a
-`StartInterval` firing during sleep is documented as missed, a calendar one runs on wake. The load-time run waits up to 300
+`StartInterval` firing during sleep is documented as missed, a calendar one runs on wake. The two
+are distinguishable on a live station, which is what makes the schedule assertable rather than
+assumed: `launchctl print` renders an interval job with a `run interval = <N> seconds` line, and a
+calendar job with an event stream named `com.apple.launchd.calendarinterval` and no interval line
+at all (observed on macOS 26.6). The load-time run waits up to 300
 seconds for a console user instead of testing once, because launchd starts this job before
 loginwindow has handed `/dev/console` to anybody and an immediate test would make every boot check
 a no-op. The `v0.3.0` release-validation

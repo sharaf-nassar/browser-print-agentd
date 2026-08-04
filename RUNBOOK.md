@@ -363,12 +363,13 @@ kickstart, then leave the station running the production cadence.
      /Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist | \
      grep -A3 StartCalendarInterval
    sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | \
-     grep -iE 'run interval|calendar'
+     grep -iE 'run interval|calendarinterval'
    ```
 
    Expect the plist on disk to show `StartCalendarInterval` with `Minute => 0`, while the
-   still-loaded older LaunchDaemon reports whatever interval it was registered with — the two
-   disagreeing is the expected mid-upgrade state, not a fault. Then either reboot the Mac or
+   still-loaded older LaunchDaemon still reports `run interval = <N> seconds` — the two disagreeing
+   is the expected mid-upgrade state, not a fault. A `run interval` line means the loaded job is
+   still the old `StartInterval` definition. Then either reboot the Mac or
    reload the system LaunchDaemon so launchd adopts the on-disk schedule:
 
    ```bash
@@ -377,15 +378,22 @@ kickstart, then leave the station running the production cadence.
    sudo launchctl bootstrap system \
      /Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist
    sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | \
-     grep -iE 'run interval|calendar'
+     grep -iE 'run interval|calendarinterval'
    ```
 
-   Expect the loaded job to report the calendar schedule rather than a seconds interval; record
-   the exact wording the first time you run this, because `launchctl print` renders
-   `StartCalendarInterval` differently from `StartInterval` and this runbook should quote what the
-   station actually prints. Rebooting instead loads the same schedule, and also exercises the
-   load-time check: the run waits for the station account to log in rather than skipping on an
-   unowned `/dev/console`.
+   Expect **no** `run interval` line at all, and instead an event stream named
+   `com.apple.launchd.calendarinterval` — captured from a station on macOS 26.6:
+
+   ```text
+               stream = com.apple.launchd.calendarinterval
+           "com.apple.launchd.calendarinterval" = {
+   ```
+
+   That string is the assertion: a calendar-scheduled job is registered as a launchd event stream
+   rather than as a timer with a seconds interval, so `run interval` reappearing means the job
+   reverted to a `StartInterval` definition. Rebooting instead loads the same schedule, and also
+   exercises the load-time check: the run waits for the station account to log in rather than
+   skipping on an unowned `/dev/console`.
 
 ### Pin or resume a station
 
@@ -1289,10 +1297,12 @@ successor by hand — the point is that nobody touched it.
       `/health`, the receipt says N+1, and `update.status` is `updated`.
 - [ ] The printer is still `healthy: true` afterwards. An update bounces the LaunchAgent, so this
       is what proves a station comes back rather than needing a hand.
-- [ ] `plutil -p` on the updater plist shows `StartCalendarInterval` with `Minute => 0`, while the
-      still-loaded job reports the schedule it was registered with. The two disagreeing immediately
-      after an automatic update is expected: `postinstall` never boots out a registered updater.
-- [ ] Reboot. The loaded job now matches the plist, and `/Library/Logs/browser-print-agentd/update.log`
+- [ ] `plutil -p` on the updater plist shows `StartCalendarInterval` with `Minute => 0`, while
+      `launchctl print` on the still-loaded job still reports `run interval = <N> seconds` from the
+      definition it was registered with. The two disagreeing immediately after an automatic update
+      is expected: `postinstall` never boots out a registered updater.
+- [ ] Reboot. `launchctl print` now shows no `run interval` line and an event stream named
+      `com.apple.launchd.calendarinterval` instead, and `/Library/Logs/browser-print-agentd/update.log`
       shows a load-time run that did **not** exit `no console user; skipping`. A line reading
       `console user appeared after Ns` is that run waiting for the login rather than giving up, and
       is the expected shape on a Mac where login is not instant.
