@@ -1,15 +1,15 @@
 # browser-print-agentd
 
-A localhost HTTP print agent for macOS. It listens on `127.0.0.1:9100` (and `127.0.0.1:9101`
-over TLS), emulates the Zebra Browser Print wire contract, and spools raw ZPL through CUPS — so
-a web page that already drives a label printer through Browser Print keeps working on a Mac with
-no vendor software installed.
+**Print labels from a web page to a label printer on your Mac.**
 
-It is not a byte-for-byte clone of a vendor daemon. Three things are deliberately different:
-printers are **discovered** from CUPS (`lpstat -v`) instead of hand-listed; every queue is
-**health-checked at job initiation** with USB-to-network failover, so a job never reports "Sent"
-into a dead printer; and every request's `Origin` is logged, with an optional allowlist enforced
-on `/write`.
+Some web apps print labels by talking to a small helper program running on your own computer.
+Zebra ships one for that job; this is a drop-in replacement for Macs that do not have it. You
+install it once and label printing starts working in the browser — there is no account to create,
+no window to keep open, and nothing to set up afterwards. It runs quietly in the background and
+keeps itself up to date.
+
+It only ever talks to your own Mac and to the printers already configured on it. It is not a
+network service, nothing on the internet can reach it, and your labels are never sent anywhere.
 
 **Not affiliated with Zebra Technologies.** `browser-print-agentd` is an independent
 reimplementation of a publicly observable localhost HTTP interface. It is not produced,
@@ -21,75 +21,61 @@ name the wire contract this agent emulates.
 migrate from another localhost print agent, roll back, uninstall, diagnose a station that will not
 print, and validate one on real hardware.
 
-## Wire contract
-
-The first four rows are the **frozen** Zebra-compatible surface. Their paths, request and response
-shapes, status codes, plain-text error bodies, and the CORS origin echo are compatibility surface
-and do not change. The last two rows are **additive extensions** — they are not part of the frozen
-contract, no caller of the frozen four is affected by their existence, and an agent that predates
-them answers those paths with the plain-text `404` its default arm has always produced.
-
-| Method | Path          | Response                                                                                                                 |
-| ------ | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `GET`  | `/available`  | `{"printer": [Device, …]}` — only queues that can actually print, USB before network, inside a 1500 ms probe budget       |
-| `GET`  | `/default`    | one `Device` object, or an **empty body** when nothing is healthy (an empty JSON object here would break callers)         |
-| `POST` | `/write`      | spools `{"data": "<raw ZPL>"}` to the requested (or resolved) printer; empty `200` on success, plain-text body on failure |
-| `POST` | `/read`       | empty `200` — dead surface for most callers, kept so the agent stays a drop-in                                            |
-| `GET`  | `/health`     | **additive** diagnostics: running version, origin posture, every queue's health, and updater status when safely available |
-| `POST` | `/print-pdf`  | **additive**: spools `{"data": "<base64 PDF>"}` as a rendered document; same `200`/plain-text convention as `/write`      |
-
-`OPTIONS` on any path answers the CORS preflight with `204`.
-
-**`/print-pdf`.** For callers that render a multi-cell label *sheet* rather than one ZPL label.
-It takes the same `{device, data}` envelope as `/write` and reuses the same printer resolution,
-USB-to-network failover, and origin gating, so a sheet and a label can never disagree about which
-printer is usable. `data` that will not base64-decode, or that decodes to bytes not beginning with
-`%PDF`, is a `400` before any CUPS call; a body over 50 MB is a `413`. A PDF always runs through a
-CUPS rendering chain — raw PDF bytes would reach the device unrendered and print as garbage. Most
-queues receive the PDF as an ordinary document. For the one stock Zebra ZPL driver that emits an
-inverted, device-stored graphic, the agent runs that queue's validated PPD offline, converts the
-bounded bitmap to upright inline `^GFA`, and raw-spools only the generated printer-native ZPL. The
-caller still sends the PDF the way up it wants it printed, and all other drivers remain untouched.
-
-**Ports.** `9100` is plain HTTP; loopback is exempt from mixed-content blocking, so
-Chromium-family browsers reach it directly from an HTTPS page. `9101` is TLS and exists only
-when the station cert pair is present — Safari needs it. Both bind loopback only; this is a
-bridge between the local browser and local CUPS, never a network service.
-
-**Versioning.** Every response — 404s and preflights included — carries
-`X-Print-Agent-Version`. That header and `GET /health` are the *only* places the running version
-is reported: the `Device` shape must never grow a version field, because callers parse and pin
-it. A binary built any way other than a tagged release reports `dev`.
-
-**Update diagnostics.** When the packaged root updater has published valid local state,
-`GET /health` adds an `update` object with its last-check time and outcome, the latest strictly
-validated manifest version, whether that version is quarantined, and whether launchd currently
-pins the updater disabled. The print agent makes no network request for this: it reads one
-sanitized root-owned file and launchd's local disabled-state dictionary. Missing, malformed,
-unsafe, or unprovable state omits `update` entirely. A check that ended before manifest
-validation omits `latestVersion` and `quarantined` rather than guessing.
-
-**Origin posture.** With no `--origin-allow` configured the agent is `log-and-allow`: every
-origin is recorded and permitted. Configure an allowlist and both print routes — `/write` and
-`/print-pdf` — reject any other origin with `403` *before* any CUPS work happens.
-
 ## Install
 
-Download the signed `.pkg` for your architecture from the
-[releases page](https://github.com/sharaf-nassar/browser-print-agentd/releases) and install it
-while the station account is logged in at the console:
+You need a Mac with Apple Silicon and your Mac's administrator password.
+
+**[Download the installer](https://github.com/sharaf-nassar/browser-print-agentd/releases/latest/download/browser-print-agentd.pkg)**
+
+Open the downloaded file, follow the prompts, and enter your Mac password when it asks. When it
+finishes, label printing works. There is no application to launch and no next step.
+
+A few things worth knowing:
+
+- **Stay logged in while it installs.** It sets itself up under your own account, and stops with
+  an error rather than half-finishing if you are not there.
+- **The label printer must already be set up on this Mac.** This agent prints to the printers your
+  Mac already has; it does not add them for you.
+- **If the installer stops and mentions port 9100 or 9101**, another label-printing program is
+  already running and has to be removed first — see
+  [the runbook](./RUNBOOK.md#migrating-from-another-localhost-print-agent).
+
+That link always points at the newest release. Every installer is signed and notarized by Apple,
+so macOS will open it without warnings.
+
+## Updates
+
+The agent updates itself. It checks for a new version every hour and installs one in the
+background when it finds it — you are never asked anything. Installing an update takes a few
+seconds, during which printing is briefly unavailable.
+
+**To force a check, restart the Mac.** Logging out and back in does not do it.
+
+Administrators: the update cadence, how to pin a station to its current build, what the updater
+verifies before installing anything, and how to roll a station back are all in
+[`RUNBOOK.md`](./RUNBOOK.md#managing-automatic-updates).
+
+## Uninstall
+
+This one does need Terminal:
 
 ```bash
-sudo installer -pkg browser-print-agentd-<version>.pkg -target /
+sudo /usr/local/bin/browser-print-agentd-uninstall
 ```
 
-Everything else is root work the package scripts do for you:
+It removes all of it — both launchd jobs and their plists, the binary, the launcher, updater state
+and cache, keychain trust (matched by SHA-1 fingerprint, never by name), the certificate and log
+directories, and the installer receipt. It deletes the log ring too, so copy that directory first
+if you are uninstalling because something was wrong.
+
+## What the installer does
+
+Everything below is root work the package scripts do for you:
 
 - **`preinstall`** removes any prior install of **this** agent, removes a path-matched Zebra
   Browser Print install if one is present, and then proves ports 9100 and 9101 are actually free.
   Anything else holding those ports — including a differently-named localhost print agent — would
-  make a `KeepAlive` agent crash-loop, so the install stops loudly instead. Uninstall that agent
-  first; see [the runbook](./RUNBOOK.md#migrating-from-another-localhost-print-agent).
+  make a `KeepAlive` agent crash-loop, so the install stops loudly instead.
 - **`postinstall`** generates or reuses a per-station self-signed cert pair (CN/SAN `localhost`,
   EKU `serverAuth`) under `~/Library/Application Support/browser-print-agentd/`, bootstraps the
   LaunchAgent into `gui/<uid>`, and proves both listeners are ready. It then uses a normal
@@ -114,43 +100,12 @@ Installed layout:
 | `/Library/Application Support/browser-print-agentd/updater/`                       | updater cache and state           |
 | `/Library/Logs/browser-print-agentd/update.log`                                    | updater verification/install log |
 
-The updater wakes at load and every 3600 seconds, adds 0-300 seconds (up to 5 minutes) of
-per-run jitter, then exits after one check. The `v0.3.0` release-validation baseline alone used a
-60-second interval with 0-5 seconds of jitter. `v0.3.1` carried the production values but failed
-background installation when `postinstall` redundantly mutated already-working keychain trust;
-`v0.3.2` is the idempotent-trust recovery release. Whenever an older updater automatically
-installs a newer one, launchd keeps the already loaded schedule until a reboot or an explicit
-updater bootout/bootstrap, even though the plist on disk carries the new interval. The load-time
-run waits up to 300 seconds for a console user before giving up, so a reboot reliably produces a
-check once someone logs in; a station left at the login window skips until the next interval. A
-strict three-line manifest at GitHub's
-`releases/latest/download` feed is authoritative: any version difference triggers an install,
-including a downgrade when a bad latest release is yanked. Before replacement it caches and
-verifies the currently installed release package; an install or version-probe failure restores
-that package and quarantines the failed version from future attempts.
-
-Its public status file is root-owned mode 644 beneath a root-owned mode-755 support directory.
-The rollback cache, quarantine list, and detailed last-run state remain in the mode-700
+The updater's public status file is root-owned mode 644 beneath a root-owned mode-755 support
+directory. The rollback cache, quarantine list, and detailed last-run state remain in the mode-700
 `updater/` child. Pin state is never copied into a stale file: `/health` reads launchd live,
 because a disabled updater cannot run again to rewrite its own publication.
 
-Pin a managed or rolled-back station with one command; package upgrades preserve this disabled
-override:
-
-```bash
-sudo launchctl disable system/io.github.sharaf-nassar.browser-print-agentd.updater
-```
-
-**Uninstall** removes all of it — both jobs and plists, binary, launcher, updater state/cache,
-keychain trust (matched by SHA-1 fingerprint, never by name), cert and log directories, and the
-installer receipt:
-
-```bash
-sudo /usr/local/bin/browser-print-agentd-uninstall
-```
-
-It deletes the log ring, so copy the directory first if you are uninstalling because something
-was wrong.
+## Configuration
 
 **Configuration** is by flag, with an environment mirror for each:
 `--bind`, `--port`, `--https-port`, `--cert-dir`, `--origin-allow`, mirrored by
@@ -207,50 +162,66 @@ asserts `X-Print-Agent-Version` is still present and unchanged, and asserts the 
 workflow's trigger surface stays tag-only. It runs as a required CI job on every push and pull
 request, and is callable locally with no arguments.
 
-## Releases and signing
+Releases are cut by tagging `v*.*.*`; `RUNBOOK.md` and `lat.md/infrastructure.md` own the signing,
+notarization, and asset-retention details.
 
-Releases are cut by tagging `v*.*.*` (`v0.1.0`, `v0.2.0`, …). Pushing the tag runs
-`.github/workflows/release.yml`, which:
+## Wire contract
 
-1. refuses to ship unless the CI gate — the `darwin/arm64` cross-build, the Go unit suite, the
-   repository hygiene gate, and the `lat check` link check — actually ran and passed (a skipped
-   job reports success, which is why that assertion exists);
-2. builds and **codesigns** the binary with a Developer ID Application identity under the
-   hardened runtime, then `productsign`s the distribution package with a Developer ID Installer
-   identity;
-3. submits the package to Apple **notarization** with `notarytool`, **staples** the ticket, and
-   verifies with `spctl` that Gatekeeper reports `Notarized Developer ID`;
-4. self-verifies that the packaged binary reports the tagged version on both `GET /health` and
-   `X-Print-Agent-Version`, and that the asset name carries that version;
-5. attaches `browser-print-agentd-<version>.pkg`, a byte-identical copy of it named
-   `browser-print-agentd.pkg`, its `.sha256`, and `update-manifest.txt` to the GitHub release,
-   marks that release latest explicitly, and records the previous release as the documented
-   rollback target.
+This agent is not a byte-for-byte clone of a vendor daemon. Three things are deliberately
+different: printers are **discovered** from CUPS (`lpstat -v`) instead of hand-listed; every queue
+is **health-checked at job initiation** with USB-to-network failover, so a job never reports "Sent"
+into a dead printer; and every request's `Origin` is logged, with an optional allowlist enforced
+on `/write`.
 
-Nothing in that workflow deletes a tag, a release, or an asset — every shipped `.pkg` stays
-independently downloadable, because rollback is exactly one step: install the previous release's
-`.pkg` over the bad one.
+The first four rows are the **frozen** Zebra-compatible surface. Their paths, request and response
+shapes, status codes, plain-text error bodies, and the CORS origin echo are compatibility surface
+and do not change. The last two rows are **additive extensions** — they are not part of the frozen
+contract, no caller of the frozen four is affected by their existence, and an agent that predates
+them answers those paths with the plain-text `404` its default arm has always produced.
 
-The version-free `browser-print-agentd.pkg` is the **evergreen download contract**: it makes
-`…/releases/latest/download/browser-print-agentd.pkg` a permanent 302 to the newest release's
-notarized installer, which is the install link a downstream operator-facing app hands a station
-that has no agent yet. It is attached unconditionally on every release and must not be renamed or
-dropped — see `RUNBOOK.md`, "The evergreen installer link".
+| Method | Path          | Response                                                                                                                 |
+| ------ | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `GET`  | `/available`  | `{"printer": [Device, …]}` — only queues that can actually print, USB before network, inside a 1500 ms probe budget       |
+| `GET`  | `/default`    | one `Device` object, or an **empty body** when nothing is healthy (an empty JSON object here would break callers)         |
+| `POST` | `/write`      | spools `{"data": "<raw ZPL>"}` to the requested (or resolved) printer; empty `200` on success, plain-text body on failure |
+| `POST` | `/read`       | empty `200` — dead surface for most callers, kept so the agent stays a drop-in                                            |
+| `GET`  | `/health`     | **additive** diagnostics: running version, origin posture, every queue's health, and updater status when safely available |
+| `POST` | `/print-pdf`  | **additive**: spools `{"data": "<base64 PDF>"}` as a rendered document; same `200`/plain-text convention as `/write`      |
 
-Secrets the workflow needs:
+`OPTIONS` on any path answers the CORS preflight with `204`.
 
-| Secret                       | Purpose                                                              |
-| ---------------------------- | -------------------------------------------------------------------- |
-| `APPLE_CERTIFICATE`          | base64 PKCS#12 carrying **both** Developer ID identities              |
-| `APPLE_CERTIFICATE_PASSWORD` | password for that PKCS#12                                             |
-| `APPLE_ID`                   | Apple ID used for notarization submission                             |
-| `APPLE_PASSWORD`             | app-specific password for that Apple ID                               |
-| `APPLE_TEAM_ID`              | Developer Team ID the identities belong to                            |
-| `KEYCHAIN_PASSWORD`          | optional; an ephemeral password is generated when it is unset         |
+**`/print-pdf`.** For callers that render a multi-cell label *sheet* rather than one ZPL label.
+It takes the same `{device, data}` envelope as `/write` and reuses the same printer resolution,
+USB-to-network failover, and origin gating, so a sheet and a label can never disagree about which
+printer is usable. `data` that will not base64-decode, or that decodes to bytes not beginning with
+`%PDF`, is a `400` before any CUPS call; a body over 50 MB is a `413`. A PDF always runs through a
+CUPS rendering chain — raw PDF bytes would reach the device unrendered and print as garbage. Most
+queues receive the PDF as an ordinary document. For the one stock Zebra ZPL driver that emits an
+inverted, device-stored graphic, the agent runs that queue's validated PPD offline, converts the
+bounded bitmap to upright inline `^GFA`, and raw-spools only the generated printer-native ZPL. The
+caller still sends the PDF the way up it wants it printed, and all other drivers remain untouched.
 
-`.github/workflows/notarize-spike.yml` is a manual (`workflow_dispatch`) smoke test that proves
-the whole signing chain against a throwaway package. Run it first after rotating any secret — it
-is the cheapest way to find out that a pasted credential is wrong.
+**Ports.** `9100` is plain HTTP; loopback is exempt from mixed-content blocking, so
+Chromium-family browsers reach it directly from an HTTPS page. `9101` is TLS and exists only
+when the station cert pair is present — Safari needs it. Both bind loopback only; this is a
+bridge between the local browser and local CUPS, never a network service.
+
+**Versioning.** Every response — 404s and preflights included — carries
+`X-Print-Agent-Version`. That header and `GET /health` are the *only* places the running version
+is reported: the `Device` shape must never grow a version field, because callers parse and pin
+it. A binary built any way other than a tagged release reports `dev`.
+
+**Update diagnostics.** When the packaged root updater has published valid local state,
+`GET /health` adds an `update` object with its last-check time and outcome, the latest strictly
+validated manifest version, whether that version is quarantined, and whether launchd currently
+pins the updater disabled. The print agent makes no network request for this: it reads one
+sanitized root-owned file and launchd's local disabled-state dictionary. Missing, malformed,
+unsafe, or unprovable state omits `update` entirely. A check that ended before manifest
+validation omits `latestVersion` and `quarantined` rather than guessing.
+
+**Origin posture.** With no `--origin-allow` configured the agent is `log-and-allow`: every
+origin is recorded and permitted. Configure an allowlist and both print routes — `/write` and
+`/print-pdf` — reject any other origin with `403` *before* any CUPS work happens.
 
 ## License
 

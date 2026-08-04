@@ -8,7 +8,8 @@ There is no frontend, no database, no service backend, and no design system in t
 The whole agent is a flat `package main` at the repository root with a stdlib-only dependency
 set — there is no `go.sum` and no vendor directory.
 
-Read `README.md` for the frozen wire contract, the install layout, and the release chain.
+Read `README.md` for the frozen wire contract and the install layout. The release chain lives in
+`RUNBOOK.md` and `lat.md/infrastructure.md`.
 
 # Repository shape
 
@@ -20,7 +21,7 @@ Read `README.md` for the frozen wire contract, the install layout, and the relea
 | `packaging/*.in`          | templates rendered from `identity.sh` by `build-pkg.sh` — never edit the output      |
 | `packaging/build-pkg.sh`  | cross-compile → stage → `pkgbuild` → `productbuild` → optional `productsign`         |
 | `scripts/check-naming.sh` | the repository hygiene gate                                                          |
-| `README.md`               | what the agent **is**: the frozen wire contract, install layout, release chain       |
+| `README.md`               | what the agent **is**: plain-language intro, install, the frozen wire contract        |
 | `RUNBOOK.md`              | what an admin **does** to a station: install, migrate, roll back, diagnose, validate |
 | `lat.md/`                 | **why** it behaves that way — the design/architecture knowledge graph                |
 

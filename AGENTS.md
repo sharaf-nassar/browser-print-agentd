@@ -5,8 +5,9 @@
 `.pkg` installer. There is no frontend, no database, no service backend, and no design system —
 if a task description implies one, the description is wrong.
 
-Read `README.md` before touching anything: it states the frozen wire contract, the install
-layout, and the release chain. Read `lat.md/` for the design intent behind the code.
+Read `README.md` before touching anything: it states the frozen wire contract and the install
+layout. The release chain lives in `RUNBOOK.md` and `lat.md/infrastructure.md`. Read `lat.md/` for
+the design intent behind the code.
 
 ## Repository shape
 
@@ -18,7 +19,7 @@ layout, and the release chain. Read `lat.md/` for the design intent behind the c
 | `packaging/*.in`          | templates rendered from `identity.sh` by `build-pkg.sh` — never edit the output      |
 | `packaging/build-pkg.sh`  | cross-compile → stage → `pkgbuild` → `productbuild` → optional `productsign`         |
 | `scripts/check-naming.sh` | the repository hygiene gate                                                          |
-| `README.md`               | what the agent **is**: the frozen wire contract, install layout, release chain       |
+| `README.md`               | what the agent **is**: plain-language intro, install, the frozen wire contract        |
 | `RUNBOOK.md`              | what an admin **does** to a station: install, migrate, roll back, diagnose, validate |
 | `lat.md/`                 | **why** it behaves that way — the design/architecture knowledge graph                |
 
