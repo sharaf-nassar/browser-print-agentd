@@ -1082,7 +1082,7 @@ fail, or observed value — against the release you validated.
 **Setup:** a station Mac that still has Zebra Browser Print installed (so removal is actually
 exercised), a Zebra printer on USB, a second Zebra reachable over the network for the failover and
 multi-printer items, the calling page reachable, and the previous release's `.pkg` downloaded for
-the last item.
+the downgrade item.
 
 A subset of the checklist does not need hands on the station: with SSH into the station account, an
 unprivileged agent binary run straight from `/tmp` against the real CUPS queue settles everything
@@ -1224,12 +1224,24 @@ hang) so that `lpstat -p <queue>` visibly stalls.
 - [ ] The wedged printer is **absent from `/available`** and present in `/health` marked unhealthy.
 - [ ] The caller still reports the agent reachable and still offers any other healthy printer.
 
-### 10. Uninstall
+### 10. Uninstall, both paths
+
+Both entry points run the same script, so both are checked: a bug in the shared removal logic once
+tore down the launchd jobs and left every file on disk, and it did so identically from the command
+line and from the app. Verifying only one path would have missed nothing — and did.
 
 - [ ] `sudo browser-print-agentd-uninstall` completes, and every check in
       [Uninstalling](#uninstalling) comes back clean — no job, no receipt, no trusted cert, ports
       free.
-- [ ] Reinstalling afterwards produces a working station again.
+- [ ] Reinstall, then open **Uninstall Browser Print Agent** from `/Applications` (Spotlight finds
+      it) and confirm it needs no download and no terminal.
+- [ ] It asks for confirmation, then for an administrator password, and reports success — **not**
+      the port warning, which after a clean run would mean a genuine port holder.
+- [ ] Afterwards the agent binary, the uninstaller, `libexec/`, both plists, the root support
+      directory, the receipt **and the app itself** are all gone, and 9100/9101 are free. The app
+      deleting itself mid-run is part of the expected result, not a fault.
+- [ ] Run the app a second time on the now-clean Mac: it reports the product is not installed
+      rather than doing anything.
 
 ### 11. Downgrade — reinstall the prior `.pkg`
 
@@ -1266,3 +1278,25 @@ unambiguous top — a solid bar across the top quarter is enough.
       station has none), a `/print-pdf` sheet is **not** inverted either. This is the half that
       catches an over-eager compensation, and it is the failure a station would otherwise discover
       only after a shift printed upside down.
+
+### 13. Automatic update lands unattended, and a reboot forces a check
+
+The update path is the one mechanism no CI job can exercise: it needs a station that was already
+running an older release when a newer one was published. Do not `kickstart` and do not install the
+successor by hand — the point is that nobody touched it.
+
+- [ ] With the station on release N and idle, publish N+1. Within the hour the agent reports N+1 on
+      `/health`, the receipt says N+1, and `update.status` is `updated`.
+- [ ] The printer is still `healthy: true` afterwards. An update bounces the LaunchAgent, so this
+      is what proves a station comes back rather than needing a hand.
+- [ ] `plutil -p` on the updater plist shows `StartCalendarInterval` with `Minute => 0`, while the
+      still-loaded job reports the schedule it was registered with. The two disagreeing immediately
+      after an automatic update is expected: `postinstall` never boots out a registered updater.
+- [ ] Reboot. The loaded job now matches the plist, and `/Library/Logs/browser-print-agentd/update.log`
+      shows a load-time run that did **not** exit `no console user; skipping`. A line reading
+      `console user appeared after Ns` is that run waiting for the login rather than giving up, and
+      is the expected shape on a Mac where login is not instant.
+- [ ] **Not yet validated:** that a check falling while the Mac is asleep runs on wake.
+      `StartCalendarInterval` is documented to behave that way and `StartInterval` is documented not
+      to, which is why the key was changed — but nobody has slept a station past the hour and
+      confirmed it. Treat the wake behaviour as designed-for, not proven.

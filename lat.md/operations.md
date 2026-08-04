@@ -222,7 +222,7 @@ motivated it.
 
 ## Station Validation Checklist
 
-Eleven items run once per station type, on a real Mac with a real label printer, before any shift
+Thirteen items run once per station type, on a real Mac with a real label printer, before any shift
 depends on the agent. The checklist exists exactly where automated coverage stops.
 
 [[tests#Tests#Agent Core]] states that boundary from the other side: the recording fake proves the
@@ -233,6 +233,17 @@ from a `kill -9` — each needs a station, a printer, and a person. The checklis
 those, and its named setup (a Mac that still has Zebra Browser Print installed, a USB printer, a
 second printer on the network, the previous release's package already downloaded) is chosen so
 removal, failover and downgrade are genuinely exercised instead of assumed.
+
+Two of the items exist because a station found what review did not. Item 10 checks BOTH uninstall
+entry points rather than one, after a single unbounded `pkill -f` pattern in the shared removal
+script tore down a station's launchd jobs and left every file on disk — identically from the
+command line and from the app, so validating either path alone would have caught it and neither
+had been run end to end. Item 13 covers the update path itself: a station already running an older
+release when a newer one is published, left untouched, plus the reboot that proves the load-time
+check waits for a login instead of exiting on an unowned `/dev/console`. Its last box is
+deliberately unchecked and says so — whether a check falling during sleep runs on wake is
+documented behaviour of `StartCalendarInterval` and the reason that key was chosen, but no station
+has been slept past the hour to confirm it.
 
 The runbook also marks which items need no hands on the machine: over SSH, an unprivileged binary
 run straight from `/tmp` against the real CUPS queue settles discovery, the stable uid, real jobs
