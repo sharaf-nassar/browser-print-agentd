@@ -245,13 +245,20 @@ that warning; re-running the installer is the supported repair.
 
 ## Managing automatic updates
 
-The package ships a short-lived root updater. It runs at load and every 86400 seconds, adds 0-900
-seconds (up to 15 minutes) of jitter, performs one check, and exits. It skips when no station
-account is logged in at the console because the package's own `postinstall` needs that account.
+The package ships a short-lived root updater. It runs at load and every 3600 seconds, adds 0-300
+seconds (up to 5 minutes) of jitter, performs one check, and exits. It needs a station account
+logged in at the console because the package's own `postinstall` needs that account, and it waits
+up to 300 seconds for one before giving up — that wait is what makes the load-time run useful,
+since launchd starts this job at boot while `/dev/console` still belongs to `root`. A station
+parked at the login window skips and waits for the next interval.
 The `v0.3.0` release-validation baseline temporarily used a 60-second interval and 0-5 seconds of
 jitter. `v0.3.1` carried the production cadence but failed background installation when it tried
 to re-add already-working certificate trust. `v0.3.2` keeps the production cadence and makes that
 trust step behaviorally idempotent.
+
+**A reboot is the supported way to force a check.** Rebooting both fires the load-time run and
+picks up the current on-disk interval. Logging out and back in does not: the updater is a
+system-domain LaunchDaemon and is not reloaded by a user session.
 
 The updater downloads the strict `update-manifest.txt` asset from the GitHub latest-release URL.
 The manifest names one version, package asset, and SHA-256 digest. Its version is compared with the
@@ -308,7 +315,7 @@ kickstart, then leave the station running the production cadence.
    ```
 
 2. Publish signed, notarized `v0.3.2` and mark it latest. Its source and packaged plist must use
-   `StartInterval` 86400, and its updater script must use 0-900 seconds of jitter. Its
+   `StartInterval` 3600, and its updater script must use 0-300 seconds of jitter. Its
    `postinstall` must skip `security add-trusted-cert` when a normal no-`-k` HTTPS request already
    validates the reused station cert.
 
@@ -350,7 +357,7 @@ kickstart, then leave the station running the production cadence.
      grep 'run interval'
    ```
 
-   Expect the plist to report `86400` while the still-loaded `v0.3.0` LaunchDaemon reports
+   Expect the plist to report `3600` while the still-loaded `v0.3.0` LaunchDaemon reports
    `run interval = 60 seconds`. Then either reboot the Mac or reload the system LaunchDaemon so
    launchd adopts the restored production interval:
 
@@ -363,7 +370,9 @@ kickstart, then leave the station running the production cadence.
      grep 'run interval'
    ```
 
-   Expect `run interval = 86400 seconds`. Rebooting instead loads the same production value.
+   Expect `run interval = 3600 seconds`. Rebooting instead loads the same production value, and
+   also exercises the load-time check: the run waits for the station account to log in rather than
+   skipping on an unowned `/dev/console`.
 
 ### Pin or resume a station
 

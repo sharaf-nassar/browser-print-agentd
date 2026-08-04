@@ -111,8 +111,13 @@ The updater is a POSIX shell script shipped as a `packaging/*.in` template rende
 `packaging/identity.sh` — the same convention as `launcher.sh.in`
 ([[packaging#Packaging#Packaging Identity#Rendered Packaging Templates]]) — installed under
 `libexec/` and run by its own root LaunchDaemon label in the system domain with `RunAtLoad`.
-Production uses an 86400-second `StartInterval` and 0-900 seconds (up to 15 minutes) of per-run
-jitter. The `v0.3.0` release-validation baseline temporarily used a 60-second interval and 0-5
+Production uses a 3600-second `StartInterval` and 0-300 seconds (up to 5 minutes) of per-run
+jitter. The hour was chosen over a day because the cost of a check is one conditional-sized fetch
+of a ~120-byte static asset from a CDN-backed URL, so raising the frequency 24-fold buys a 24-fold
+cut in worst-case staleness for traffic nobody can measure — the cheapest available substitute for
+a push channel these unmanaged stations cannot have
+([[operations#Station Operations#Auto-Update Decision#Rejected Alternatives]]). The `v0.3.0`
+release-validation baseline temporarily used a 60-second interval and 0-5
 seconds of jitter so `v0.3.1` could prove automatic replacement without a day-long wait; `v0.3.1`
 restores the production values. An automatic install replaces the plist but deliberately leaves
 the updater that invoked it loaded, so launchd retains `v0.3.0`'s 60-second schedule until reboot
@@ -122,7 +127,13 @@ postinstall booting out the process that spawned `installer` — cannot occur, a
 [[packaging#Packaging#Station Installer#The launchd On-Demand Gate]] does not apply to it, being
 a `gui`-domain condition on a job the system domain never sees.
 
-Each run skips unless a console user is present, because `postinstall` requires one. Otherwise it
+Each run needs a console user, because `postinstall` requires one, and waits up to 300 seconds for
+one rather than testing once. That wait is what makes `RunAtLoad` mean anything: launchd starts
+the job at boot while `/dev/console` still belongs to `root`, so a single test would make every
+boot check exit as `skipped-no-user` and a reboot could never force a check. A station parked at
+the login window still gives up and waits for the next interval instead of holding a process open.
+A reboot is therefore the supported way to force a check; a logout and login is not, because a
+system-domain LaunchDaemon is not reloaded by a user session. Otherwise the run
 fetches `update-manifest.txt` from the stable `releases/latest/download/…` URL and compares its
 `version`, `asset`, and `sha256` records against the installed receipt via `pkgutil --pkg-info`.
 The byte-exact format is owned by
@@ -163,7 +174,7 @@ the release `--latest` explicitly.
 
 ### Rejected Alternatives
 
-Five other update stories were considered and rejected, each on a property this product cannot
+Seven other update stories were considered and rejected, each on a property this product cannot
 give up. Recording them is part of the decision itself.
 
 **Staying manual-only** scales with station count and depends on someone noticing a station is
@@ -182,6 +193,27 @@ a managed fleet instead gets the one-command pin as its opt-out.
 
 **Polling the GitHub REST API** costs 60 requests per hour shared across a NAT IP and a
 JSON-parsing dependency; the `releases/latest/download` redirect needs neither.
+
+**A push channel** has no delivery mechanism here. Device-level APNs requires MDM enrollment these
+stations do not have, and the updater is a shell-script LaunchDaemon with no bundle and no push
+entitlement. A self-hosted socket — WebSocket, SSE, or MQTT — would deliver it, but at the price of
+this product's first service backend, whose uptime would replace GitHub's CDN as the single point
+of failure in the update path. It would also end the short-lived process model that makes the
+self-update race impossible, restore `KeepAlive` in a repository already bitten by launchd respawn
+semantics ([[packaging#Packaging#Station Installer#The launchd On-Demand Gate]]), and stand a
+persistent outbound root connection on every station where there is currently one periodic fetch
+of a signed, checksummed static file. Since any push channel that must not miss an event still
+needs a reconciliation poll, push would be added to polling rather than replace it. A one-hour
+interval is the substitute, and MDM enrollment — not a bespoke socket — is the migration that would
+make real push available, at which point the updater is deleted rather than extended.
+
+**A user-facing manual check button** was specified and abandoned. Its findings are kept in
+`specs/001-manual-update-check/spec.md` because they remain true of any future attempt: the
+one-command pin may not survive a launchd demand-start, a world-writable trigger reproduces the
+same local-actor capability used to reject the agent-side route, the payload's first `.app` bundle
+brings unproven notarization and relocatable-bundle handling, and a click that lands mid-shift
+bounces the print agent under whoever is printing. The hourly interval removed the latency that
+motivated it.
 
 ## Station Validation Checklist
 

@@ -15,3 +15,7 @@
 # lat.md local index. The markdown under lat.md/ is the source of truth; the
 # embedding cache is rebuilt on demand and is per-machine.
 lat.md/.cache/
+
+# Installer staging output. `packaging/build-pkg.sh --stage-only` writes here on
+# every run; the shipped .pkg is built and signed by CI, never committed.
+packaging/dist/

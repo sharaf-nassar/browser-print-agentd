@@ -7,11 +7,12 @@
   __UPDATER_PLIST_PATH__. This is deliberately separate from the per-user
   LaunchAgent: only this process has network egress or installation privilege.
 
-  RunAtLoad covers a reboot. Production checks run every 86400 seconds and the
-  updater adds up to 900 seconds (15 minutes) of jitter before its network
-  request. KeepAlive is intentionally absent; a fresh process reads the
-  currently installed script on every run and cannot be killed by its own
-  package replacement.
+  RunAtLoad covers a reboot, and is the reason the script waits for a console
+  user rather than testing once: this job starts before anyone has logged in.
+  Production checks run every 3600 seconds and the updater adds up to 300
+  seconds (5 minutes) of jitter before its network request. KeepAlive is
+  intentionally absent; a fresh process reads the currently installed script on
+  every run and cannot be killed by its own package replacement.
 -->
 <plist version="1.0">
 <dict>
@@ -33,7 +34,7 @@
 	<true/>
 
 	<key>StartInterval</key>
-	<integer>86400</integer>
+	<integer>3600</integer>
 
 	<key>ProcessType</key>
 	<string>Background</string>

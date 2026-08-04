@@ -33,6 +33,11 @@ CACHE_VERSION="$STATE_DIR/good.version"
 CACHE_SHA256="$STATE_DIR/good.sha256"
 INSTALL_MARKER="/var/run/__PRODUCT_NAME__-installing"
 
+# How long a run waits for someone to log in before giving up. A RunAtLoad run
+# starts while /dev/console still belongs to root, so a single test would make
+# every boot check a no-op.
+CONSOLE_WAIT_SECONDS=300
+
 CURL=/usr/bin/curl
 CODESIGN=/usr/bin/codesign
 PKGUTIL=/usr/sbin/pkgutil
@@ -351,18 +356,33 @@ if /usr/bin/pgrep -x installer >/dev/null 2>&1; then
 	write_status skipped-install ""
 	exit 0
 fi
+# A RunAtLoad run reaches this point before loginwindow has handed /dev/console
+# to anyone, so testing once would make every boot check exit as skipped-no-user
+# and a reboot could never trigger a check. Wait a bounded time for the login
+# instead. A station parked at loginwindow still gives up and waits for the next
+# interval rather than holding a process open.
 CONSOLE_USER="$(resolve_console_user || true)"
+console_waited=0
+while [ -z "$CONSOLE_USER" ] && [ "$console_waited" -lt "$CONSOLE_WAIT_SECONDS" ]; do
+	/bin/sleep 5
+	console_waited=$((console_waited + 5))
+	CONSOLE_USER="$(resolve_console_user || true)"
+done
 if [ -z "$CONSOLE_USER" ]; then
-	log "no console user; skipping"
+	log "no console user after ${console_waited}s; skipping"
 	write_status skipped-no-user ""
 	exit 0
 fi
+if [ "$console_waited" -gt 0 ]; then
+	log "console user appeared after ${console_waited}s"
+fi
 
-# Spread production requests across 0-900 seconds (up to 15 minutes) without
-# keeping a persistent daemon.
+# Spread production requests across 0-300 seconds (up to 5 minutes) without
+# keeping a persistent daemon. The spread stays well inside the hourly interval
+# so a run never overlaps the one behind it.
 jitter_seed="$(printf '%s:%s:%s\n' "$(/bin/date +%s)" "$$" "$(/bin/hostname)" |
 	/usr/bin/cksum | /usr/bin/awk '{print $1}')"
-jitter=$((jitter_seed % 901))
+jitter=$((jitter_seed % 301))
 log "scheduled check; delaying $jitter seconds for jitter"
 /bin/sleep "$jitter"
 
