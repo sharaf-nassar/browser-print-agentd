@@ -245,8 +245,16 @@ that warning; re-running the installer is the supported repair.
 
 ## Managing automatic updates
 
-The package ships a short-lived root updater. It runs at load and every 3600 seconds, adds 0-300
-seconds (up to 5 minutes) of jitter, performs one check, and exits. It needs a station account
+The package ships a short-lived root updater. It runs at load and hourly on the hour, adds 0-300
+seconds (up to 5 minutes) of jitter, performs one check, and exits.
+
+The schedule is a `StartCalendarInterval` of `Minute 0`, not a `StartInterval`. That is deliberate
+and it is about sleep: `launchd.plist(5)` says a `StartInterval` firing that falls while the system
+is asleep "will be missed due to shortcomings in `kqueue(3)`", while a `StartCalendarInterval` job
+starts "the next time the computer wakes up", coalescing multiple missed intervals into one. A
+station that sleeps overnight would otherwise wake and wait for a further full interval, and
+`RunAtLoad` does not cover it because waking is not loading. The script-level jitter is what stops
+a fleet that all fires at `:00` from arriving at GitHub together. It needs a station account
 logged in at the console because the package's own `postinstall` needs that account, and it waits
 up to 300 seconds for one before giving up — that wait is what makes the load-time run useful,
 since launchd starts this job at boot while `/dev/console` still belongs to `root`. A station
@@ -315,7 +323,8 @@ kickstart, then leave the station running the production cadence.
    ```
 
 2. Publish signed, notarized `v0.3.2` and mark it latest. Its source and packaged plist must use
-   `StartInterval` 3600, and its updater script must use 0-300 seconds of jitter. Its
+   a `StartCalendarInterval` of `Minute 0`, and its updater script must use 0-300 seconds of
+   jitter. Its
    `postinstall` must skip `security add-trusted-cert` when a normal no-`-k` HTTPS request already
    validates the reused station cert.
 
@@ -352,14 +361,15 @@ kickstart, then leave the station running the production cadence.
    ```bash
    plutil -p \
      /Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist | \
-     grep StartInterval
+     grep -A3 StartCalendarInterval
    sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | \
-     grep 'run interval'
+     grep -iE 'run interval|calendar'
    ```
 
-   Expect the plist to report `3600` while the still-loaded `v0.3.0` LaunchDaemon reports
-   `run interval = 60 seconds`. Then either reboot the Mac or reload the system LaunchDaemon so
-   launchd adopts the restored production interval:
+   Expect the plist on disk to show `StartCalendarInterval` with `Minute => 0`, while the
+   still-loaded older LaunchDaemon reports whatever interval it was registered with — the two
+   disagreeing is the expected mid-upgrade state, not a fault. Then either reboot the Mac or
+   reload the system LaunchDaemon so launchd adopts the on-disk schedule:
 
    ```bash
    sudo launchctl bootout \
@@ -367,12 +377,15 @@ kickstart, then leave the station running the production cadence.
    sudo launchctl bootstrap system \
      /Library/LaunchDaemons/io.github.sharaf-nassar.browser-print-agentd.updater.plist
    sudo launchctl print system/io.github.sharaf-nassar.browser-print-agentd.updater | \
-     grep 'run interval'
+     grep -iE 'run interval|calendar'
    ```
 
-   Expect `run interval = 3600 seconds`. Rebooting instead loads the same production value, and
-   also exercises the load-time check: the run waits for the station account to log in rather than
-   skipping on an unowned `/dev/console`.
+   Expect the loaded job to report the calendar schedule rather than a seconds interval; record
+   the exact wording the first time you run this, because `launchctl print` renders
+   `StartCalendarInterval` differently from `StartInterval` and this runbook should quote what the
+   station actually prints. Rebooting instead loads the same schedule, and also exercises the
+   load-time check: the run waits for the station account to log in rather than skipping on an
+   unowned `/dev/console`.
 
 ### Pin or resume a station
 

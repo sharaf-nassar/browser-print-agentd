@@ -187,8 +187,10 @@ diagnosis so the next reader does not go hunting for a `KeepAlive` variant that 
 The updater is a separate, short-lived root LaunchDaemon; the print agent remains an unprivileged
 per-user LaunchAgent with no egress or update routes.
 
-`${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load and every 3600 seconds,
-with 0-300 seconds (up to 5 minutes) of script-level jitter. The load-time run waits up to 300
+`${UPDATER_LABEL}` runs `${UPDATER_PATH}` in the system domain at load and hourly on the hour, via
+a `StartCalendarInterval` of `Minute 0` rather than a `StartInterval`, with 0-300 seconds (up to 5
+minutes) of script-level jitter. The calendar key is what makes a sleeping station recover: a
+`StartInterval` firing during sleep is documented as missed, a calendar one runs on wake. The load-time run waits up to 300
 seconds for a console user instead of testing once, because launchd starts this job before
 loginwindow has handed `/dev/console` to anybody and an immediate test would make every boot check
 a no-op. The `v0.3.0` release-validation

@@ -111,8 +111,13 @@ The updater is a POSIX shell script shipped as a `packaging/*.in` template rende
 `packaging/identity.sh` — the same convention as `launcher.sh.in`
 ([[packaging#Packaging#Packaging Identity#Rendered Packaging Templates]]) — installed under
 `libexec/` and run by its own root LaunchDaemon label in the system domain with `RunAtLoad`.
-Production uses a 3600-second `StartInterval` and 0-300 seconds (up to 5 minutes) of per-run
-jitter. The hour was chosen over a day because the cost of a check is one conditional-sized fetch
+Production uses a `StartCalendarInterval` of `Minute 0` — hourly, on the hour — and 0-300 seconds
+(up to 5 minutes) of per-run jitter, which is what stops a fleet all firing at `:00` from arriving
+together. The calendar key is chosen over `StartInterval` for one reason: `launchd.plist(5)` says a
+`StartInterval` firing that falls while the system is asleep is missed outright, while a
+`StartCalendarInterval` job starts when the machine next wakes, coalescing missed intervals into
+one. A station that sleeps overnight would otherwise wake and wait a further full interval, and
+`RunAtLoad` does not cover it because waking is not loading. The hour was chosen over a day because the cost of a check is one conditional-sized fetch
 of a ~120-byte static asset from a CDN-backed URL, so raising the frequency 24-fold buys a 24-fold
 cut in worst-case staleness for traffic nobody can measure — the cheapest available substitute for
 a push channel these unmanaged stations cannot have

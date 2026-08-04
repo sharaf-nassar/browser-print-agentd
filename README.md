@@ -47,7 +47,8 @@ so macOS will open it without warnings.
 
 The agent updates itself. It checks for a new version every hour and installs one in the
 background when it finds it — you are never asked anything. Installing an update takes a few
-seconds, during which printing is briefly unavailable.
+seconds, during which printing is briefly unavailable. If the Mac was asleep at the top of the
+hour, the check happens when it wakes.
 
 **To force a check, restart the Mac.** Logging out and back in does not do it.
 
