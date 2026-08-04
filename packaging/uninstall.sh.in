@@ -151,8 +151,18 @@ if [ -n "$TARGET_HOME" ] && [ -f "$TARGET_HOME/Library/LaunchAgents/${LABEL}.pli
 fi
 
 # Anything still running after the job is gone (a hand-started agent, say).
-/usr/bin/pkill -f "$BINARY" >/dev/null 2>&1 || true
-/usr/bin/pkill -f "$UPDATER" >/dev/null 2>&1 || true
+#
+# The trailing boundary is load-bearing, not decoration. `pkill -f` matches its
+# pattern anywhere in a process's whole command line, and THIS SCRIPT's command
+# line is "$BINARY-uninstall" — a bare -f "$BINARY" therefore matches the
+# uninstaller itself and kills the run one line before the payload is deleted,
+# leaving a station with its launchd jobs torn down and every file still on
+# disk. Requiring whitespace-or-end after the path lets the agent's own command
+# line match while "$BINARY-uninstall" cannot, because the next character there
+# is a hyphen. Anchoring with ^ instead would be wrong: the updater is a shell
+# script, so its command line begins with the interpreter, not the path.
+/usr/bin/pkill -f "$BINARY([[:space:]]|\$)" >/dev/null 2>&1 || true
+/usr/bin/pkill -f "$UPDATER([[:space:]]|\$)" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # 2. Untrust and delete the station cert

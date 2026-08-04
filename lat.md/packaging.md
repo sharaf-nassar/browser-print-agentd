@@ -278,6 +278,15 @@ account directory. One ordering trap is documented rather than designed around: 
 deletes the active log and every archive, so copy the directory first if the agent is being
 removed because something was wrong.
 
+One line in it is a trap that bit a real station. Stale processes are cleared with `pkill -f`,
+which matches its pattern anywhere in a command line — and the uninstaller's own command line is
+`${BINARY_PATH}-uninstall`, so a bare `pkill -f "${BINARY_PATH}"` matches the uninstaller itself.
+It killed the run one line before the payload deletion, leaving stations with their launchd jobs
+torn down and every file still on disk, and it did so on both the command-line and GUI paths. The
+pattern now requires whitespace-or-end after the path, which the agent's command line satisfies and
+`-uninstall` cannot. Anchoring with `^` would be the obvious fix and is wrong: the updater is a
+shell script, so its command line begins with the interpreter rather than the path.
+
 Everything the script does is per-account below the machine-wide payload, so a station with more
 than one printing account needs one `--user <account>` run per account. When an admin runs it at
 all is an operations question rather than a packaging one:

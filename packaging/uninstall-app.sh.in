@@ -20,6 +20,7 @@ set -eu
 
 PRODUCT_TITLE="__PRODUCT_TITLE__"
 UNINSTALLER="__UNINSTALLER_PATH__"
+AGENT_BINARY="__BINARY_PATH__"
 
 # `display dialog` needs a foreground process to attach to. Launched from
 # Finder the app already is one; `-e 'tell application "System Events"'` would
@@ -70,8 +71,24 @@ if [ "$status" -eq 0 ]; then
 	exit 0
 fi
 
-# The uninstaller's only non-zero case is a port still held after removal: the
-# files are gone either way, so this says what actually happened rather than
-# implying nothing was removed.
-dialog "$PRODUCT_TITLE was removed, but something is still using port 9100 or 9101.\n\nThe files are gone. An administrator can check with:\nlsof -nP -iTCP:9100 -sTCP:LISTEN" caution
+# A non-zero status does NOT identify which failure happened, and guessing is
+# how this dialog once told somebody a port was busy when the real problem was
+# that the uninstall had aborted halfway. Whether the agent binary is still on
+# disk is the honest discriminator: gone means the removal finished and the
+# only remaining non-zero path is the port warning; still there means it did
+# not finish, and the user gets the actual error instead of a story.
+if [ ! -e "$AGENT_BINARY" ]; then
+	dialog "$PRODUCT_TITLE was removed, but something is still using port 9100 or 9101.\n\nThe files are gone. An administrator can check with:\nlsof -nP -iTCP:9100 -sTCP:LISTEN" caution
+	exit 1
+fi
+
+# Last line of the captured output, with the characters that would terminate an
+# AppleScript string literal removed so the dialog cannot be broken by the very
+# error it is trying to report.
+detail="$(printf '%s' "$output" | /usr/bin/tail -n 1 | /usr/bin/sed 's/["\\]//g')"
+if [ -z "$detail" ]; then
+	detail="no error output was returned."
+fi
+
+dialog "$PRODUCT_TITLE could not be fully removed and is still installed.\n\n$detail\n\nAn administrator can finish the job by running:\nsudo $UNINSTALLER" stop
 exit 1
