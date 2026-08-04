@@ -39,6 +39,7 @@ UPDATER_LABEL="__UPDATER_LABEL__"
 UPDATER_PLIST="__UPDATER_PLIST_PATH__"
 SYSTEM_SUPPORT_DIR="__SYSTEM_SUPPORT_DIR__"
 SYSTEM_LOG_DIR="__SYSTEM_LOG_DIR__"
+UNINSTALL_APP="__UNINSTALL_APP_PATH__"
 SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 PORTS=(9100 9101)
 PORT_SETTLE_SECONDS=10
@@ -197,7 +198,12 @@ fi
 # 3. Remove the payload and the receipt
 # ---------------------------------------------------------------------------
 
-for path in "$BINARY" "$LIBEXEC_DIR" "$SYSTEM_SUPPORT_DIR" "$SYSTEM_LOG_DIR"; do
+# UNINSTALL_APP is in this list because the installer put it there. When the run
+# was started by double-clicking that app, this deletes the bundle out from
+# under the running script — which is safe on macOS, where an executing file
+# unlinks cleanly and keeps running from its open inode.
+for path in "$BINARY" "$LIBEXEC_DIR" "$SYSTEM_SUPPORT_DIR" "$SYSTEM_LOG_DIR" \
+	"$UNINSTALL_APP"; do
 	if [ -e "$path" ]; then
 		log "removing $path"
 		/bin/rm -rf "$path"

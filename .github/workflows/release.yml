@@ -190,12 +190,6 @@ jobs:
           echo "STABLE_PKG_PATH=$RUNNER_TEMP/release/$BINARY_NAME.pkg" >> "$GITHUB_ENV"
           echo "CHECKSUM_PATH=$RUNNER_TEMP/release/$BINARY_NAME-$VERSION.pkg.sha256" >> "$GITHUB_ENV"
           echo "MANIFEST_PATH=$RUNNER_TEMP/release/update-manifest.txt" >> "$GITHUB_ENV"
-          # The GUI uninstaller. Version-free on purpose: it carries no build,
-          # only a script that runs the uninstaller already on the station, so a
-          # version in its name would name nothing. That also makes
-          # `latest/download/<product>-uninstall.pkg` a permanent link, the same
-          # way the evergreen installer name does.
-          echo "UNINSTALL_PKG_PATH=$RUNNER_TEMP/release/$BINARY_NAME-uninstall.pkg" >> "$GITHUB_ENV"
           echo "releasing $BINARY_NAME $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-go@v6
@@ -294,17 +288,6 @@ jobs:
             exit 1
           fi
           pkgutil --check-signature "$PKG_PATH"
-          # The same run also produces the payload-free GUI uninstaller. It is
-          # asserted here rather than discovered, for the same reason the
-          # installer is: a packaging script that stopped emitting it should
-          # fail the release rather than ship a half-answer to "how do I remove
-          # this", which is a question a station user can only ask once.
-          if [ ! -f "$UNINSTALL_PKG_PATH" ]; then
-            echo "::error::build-pkg.sh did not produce $UNINSTALL_PKG_PATH"
-            ls -l "$RUNNER_TEMP/release"
-            exit 1
-          fi
-          pkgutil --check-signature "$UNINSTALL_PKG_PATH"
 
       # The version half of the release contract. It runs the binary EXTRACTED
       # FROM THE BUILT PACKAGE, not a second build of the same source: a version
@@ -381,49 +364,36 @@ jobs:
             fi
           done
           cd "$RUNNER_TEMP/release"
-          # Both packages go through one implementation of submit-and-check. The
-          # uninstaller contains no Mach-O binary at all — only shell scripts —
-          # so nothing in it needs a hardened runtime; the Developer ID
-          # Installer signature on the package is the whole of what the notary
-          # service has to accept. Looping rather than copying this block keeps
-          # the failure handling identical for both.
-          for TARGET in "$PKG_PATH" "$UNINSTALL_PKG_PATH"; do
-            NAME=$(basename "$TARGET")
-            LOG="notarize-$NAME.log"
-            set +e
-            xcrun notarytool submit "$TARGET" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait --timeout 30m 2>&1 | tee "$LOG"
-            RC=${PIPESTATUS[0]}
-            set -e
-            echo "notarytool exit for $NAME: $RC"
-            if ! grep -q "status: Accepted" "$LOG"; then
-              SUB=$(grep -m1 "  id:" "$LOG" | awk '{print $2}' || true)
-              if [ -n "$SUB" ]; then
-                echo "== notarization log for $NAME =="
-                xcrun notarytool log "$SUB" \
-                  --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
-                  --team-id "$APPLE_TEAM_ID" || true
-              fi
-              echo "::error::$NAME was not Accepted by the notary service"
-              exit 1
+          set +e
+          xcrun notarytool submit "$PKG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m 2>&1 | tee notarize.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "notarytool exit: $RC"
+          if ! grep -q "status: Accepted" notarize.log; then
+            SUB=$(grep -m1 "  id:" notarize.log | awk '{print $2}' || true)
+            if [ -n "$SUB" ]; then
+              echo "== notarization log =="
+              xcrun notarytool log "$SUB" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
             fi
-            echo "✅ $NAME notarization Accepted" >> "$GITHUB_STEP_SUMMARY"
-          done
+            echo "::error::The .pkg was not Accepted by the notary service"
+            exit 1
+          fi
+          echo "✅ .pkg notarization Accepted" >> "$GITHUB_STEP_SUMMARY"
 
       # Stapling is what lets a station install with no network path to Apple,
       # so the ticket is validated rather than assumed.
       - name: Staple the notarization ticket
         run: |
           set -euo pipefail
-          for TARGET in "$PKG_PATH" "$UNINSTALL_PKG_PATH"; do
-            xcrun stapler staple -v "$TARGET"
-            xcrun stapler validate -v "$TARGET"
-            echo "✅ $(basename "$TARGET") ticket stapled and validated" \
-              >> "$GITHUB_STEP_SUMMARY"
-          done
+          xcrun stapler staple -v "$PKG_PATH"
+          xcrun stapler validate -v "$PKG_PATH"
+          echo "✅ notarization ticket stapled and validated" >> "$GITHUB_STEP_SUMMARY"
 
       # Assess the package exactly as a downloaded one is assessed: the
       # quarantine attribute is written on purpose and never removed before the
@@ -432,33 +402,26 @@ jobs:
       - name: Assess Gatekeeper with the quarantine bit set
         run: |
           set -euo pipefail
-          # The uninstaller is assessed on the same terms as the installer. A
-          # station user downloads it in exactly the same way, so an unassessed
-          # one could hand them a Gatekeeper wall at the moment they are trying
-          # to remove software.
-          for TARGET in "$PKG_PATH" "$UNINSTALL_PKG_PATH"; do
-            NAME=$(basename "$TARGET")
-            xattr -w com.apple.quarantine \
-              "0081;00000000;Safari;00000000-0000-0000-0000-000000000000" "$TARGET"
-            set +e
-            ASSESS=$(spctl --assess -vv --type install "$TARGET" 2>&1)
-            RC=$?
-            set -e
-            echo "$ASSESS"
-            if [ "$RC" -ne 0 ]; then
-              echo "::error::spctl rejected the quarantined $NAME (exit $RC)"
-              exit 1
-            fi
-            if ! echo "$ASSESS" | grep -q "source=Notarized Developer ID"; then
-              echo "::error::spctl accepted $NAME but not as a Notarized Developer ID installer"
-              exit 1
-            fi
-            # The bit is cleared only after the verdict, so the published asset
-            # is not shipped carrying this runner's quarantine metadata.
-            xattr -d com.apple.quarantine "$TARGET"
-            echo "✅ spctl: $NAME accepted, source=Notarized Developer ID (quarantined)" \
-              >> "$GITHUB_STEP_SUMMARY"
-          done
+          xattr -w com.apple.quarantine \
+            "0081;00000000;Safari;00000000-0000-0000-0000-000000000000" "$PKG_PATH"
+          set +e
+          ASSESS=$(spctl --assess -vv --type install "$PKG_PATH" 2>&1)
+          RC=$?
+          set -e
+          echo "$ASSESS"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::spctl rejected the quarantined .pkg (exit $RC)"
+            exit 1
+          fi
+          if ! echo "$ASSESS" | grep -q "source=Notarized Developer ID"; then
+            echo "::error::spctl accepted the .pkg but not as a Notarized Developer ID installer"
+            exit 1
+          fi
+          # The bit is cleared only after the verdict, so the published asset is
+          # not shipped carrying this runner's quarantine metadata.
+          xattr -d com.apple.quarantine "$PKG_PATH"
+          echo "✅ spctl: accepted, source=Notarized Developer ID (quarantined)" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       # The asset name carries the version, so every release keeps its own
       # installer and the previous notarized .pkg stays downloadable — that is
@@ -614,7 +577,6 @@ jobs:
           # by design.
           gh release upload "$TAG_NAME" \
             "$PKG_PATH" "$STABLE_PKG_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH" \
-            "$UNINSTALL_PKG_PATH" \
             --clobber
           # Publish the stable feed only after every asset is attached. This is
           # explicit rather than GitHub's date/version-based latest selection,
@@ -625,7 +587,7 @@ jobs:
           gh release edit "$TAG_NAME" --latest
           gh release view "$TAG_NAME" --json assets \
             --jq '.assets[] | "\(.name)\t\(.size) bytes"'
-          echo "✅ published $(basename "$PKG_PATH"), $(basename "$STABLE_PKG_PATH"), $(basename "$CHECKSUM_PATH"), $(basename "$MANIFEST_PATH"), and $(basename "$UNINSTALL_PKG_PATH") on $TAG_NAME" \
+          echo "✅ published $(basename "$PKG_PATH"), $(basename "$STABLE_PKG_PATH"), $(basename "$CHECKSUM_PATH"), and $(basename "$MANIFEST_PATH") on $TAG_NAME" \
             >> "$GITHUB_STEP_SUMMARY"
 
       # Retention is only real if it is checked, so the run that ships a build

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  pkgbuild component property list, rendered by build-pkg.sh from
+  packaging/identity.sh.
+
+  This file exists for one key. The payload now contains an app bundle, and
+  pkgbuild's synthesized default for a bundle is BundleIsRelocatable=true: the
+  installer would then look for an existing copy of this bundle identifier
+  anywhere on disk and install over THAT path instead of the one in the payload.
+  A user who once dragged the uninstaller somewhere would silently redirect
+  every future update, leaving /Applications empty while the receipt pointed
+  elsewhere.
+
+  It is hand-written rather than produced by pkgbuild's analyze pass, because
+  that pass only runs on macOS and this repository's layout has to stay
+  assertable from a Linux stage-only run.
+
+  Note for editors: a double hyphen is illegal inside an XML comment, so tool
+  flag names are written here without their leading dashes on purpose.
+-->
+<plist version="1.0">
+<array>
+	<dict>
+		<key>BundleHasStrictIdentifier</key>
+		<true/>
+		<key>BundleIsRelocatable</key>
+		<false/>
+		<key>BundleIsVersionChecked</key>
+		<false/>
+		<key>BundleOverwriteAction</key>
+		<string>upgrade</string>
+		<key>RootRelativeBundlePath</key>
+		<string>__UNINSTALL_APP_REL_PATH__</string>
+	</dict>
+</array>
+</plist>

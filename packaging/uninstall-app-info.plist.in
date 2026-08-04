@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for __UNINSTALL_APP_NAME__, rendered by build-pkg.sh from
+  packaging/identity.sh and installed inside the one product package.
+
+  CFBundleIdentifier is distinct from the agent's BUNDLE_ID: that string is
+  already both the launchd Label and the productbuild package identifier, and a
+  bundle sharing it would make `pkgutil` and `codesign` describe two different
+  things by one name.
+
+  There is no CFBundleIconFile. Shipping an icon would mean shipping a binary
+  .icns asset that no template can render and the naming gate cannot read, so
+  the app takes the generic application icon rather than adding an unreviewable
+  file to the payload.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+
+	<key>CFBundleName</key>
+	<string>__UNINSTALL_TITLE__</string>
+
+	<key>CFBundleDisplayName</key>
+	<string>__UNINSTALL_TITLE__</string>
+
+	<key>CFBundleIdentifier</key>
+	<string>__UNINSTALL_APP_BUNDLE_ID__</string>
+
+	<key>CFBundleExecutable</key>
+	<string>__UNINSTALL_APP_EXEC__</string>
+
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# uninstall-app — the executable inside __UNINSTALL_APP_NAME__.
+#
+# Rendered from packaging/identity.sh and installed at
+# __UNINSTALL_APP_PATH__/Contents/MacOS/__UNINSTALL_APP_EXEC__.
+#
+# It owns no removal logic. __UNINSTALLER_PATH__ is the single implementation of
+# what "uninstalled" means, and this wrapper exists only to give it a confirm
+# dialog, one native administrator prompt, and a result the user can read.
+# Duplicating any removal step here would create a second definition that could
+# drift from the one the command line uses.
+#
+# Everything here is osascript, because the app has no Mach-O of its own and
+# needs none: `do shell script ... with administrator privileges` is macOS's own
+# authorization prompt, so there is no privileged helper to install and nothing
+# runs as root except the uninstaller itself.
+
+set -eu
+
+PRODUCT_TITLE="__PRODUCT_TITLE__"
+UNINSTALLER="__UNINSTALLER_PATH__"
+
+# `display dialog` needs a foreground process to attach to. Launched from
+# Finder the app already is one; `-e 'tell application "System Events"'` would
+# add an Automation consent prompt for no benefit, so the dialogs are plain.
+dialog() {
+	/usr/bin/osascript \
+		-e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with title \"$PRODUCT_TITLE\" with icon $2" \
+		>/dev/null 2>&1 || true
+}
+
+if [ ! -x "$UNINSTALLER" ]; then
+	dialog "$PRODUCT_TITLE is not installed on this Mac, so there is nothing to remove." stop
+	exit 0
+fi
+
+# Cancel returns a non-zero status from osascript; `set -e` would take that as a
+# failure, so the button is read rather than the exit code.
+answer="$(
+	/usr/bin/osascript \
+		-e "display dialog \"Remove $PRODUCT_TITLE from this Mac?\n\nLabel printing from the browser will stop working. Your printers are not changed and stay in System Settings.\" buttons {\"Cancel\", \"Remove\"} default button \"Cancel\" with title \"$PRODUCT_TITLE\" with icon caution" \
+		-e 'button returned of result' 2>/dev/null || true
+)"
+
+if [ "$answer" != "Remove" ]; then
+	exit 0
+fi
+
+# One authorization prompt, then the real uninstaller runs as root. Its output
+# goes to the log it writes itself; what matters here is the exit status.
+# A cancelled password prompt is user error code -128, which must read as
+# "cancelled" rather than "the uninstall failed".
+set +e
+output="$(
+	/usr/bin/osascript \
+		-e "do shell script quoted form of \"$UNINSTALLER\" with administrator privileges" 2>&1
+)"
+status=$?
+set -e
+
+case "$output" in
+*"User canceled"* | *"-128"*)
+	exit 0
+	;;
+esac
+
+if [ "$status" -eq 0 ]; then
+	dialog "$PRODUCT_TITLE has been removed from this Mac.\n\nYour printers were not changed and are still in System Settings." note
+	exit 0
+fi
+
+# The uninstaller's only non-zero case is a port still held after removal: the
+# files are gone either way, so this says what actually happened rather than
+# implying nothing was removed.
+dialog "$PRODUCT_TITLE was removed, but something is still using port 9100 or 9101.\n\nThe files are gone. An administrator can check with:\nlsof -nP -iTCP:9100 -sTCP:LISTEN" caution
+exit 1

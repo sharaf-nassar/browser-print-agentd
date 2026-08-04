@@ -78,17 +78,21 @@ RELEASE_BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases"
 # Build-time artifact names.
 COMPONENT_PKG_NAME="${PRODUCT_NAME}-component.pkg"
 
-# The GUI uninstaller. A payload-free package whose only job is to run the
-# already-installed UNINSTALLER_PATH as root, so a station user can remove the
-# product by opening a file instead of typing a sudo command. Its identifier is
-# distinct from BUNDLE_ID because it is a different package; pkgbuild
-# --nopayload writes no receipt for it, so it leaves nothing of its own behind.
-# The asset name carries no version on purpose: unlike the installer, this
-# package contains no build, so a version in the name would name nothing.
-UNINSTALL_PKG_ID="${BUNDLE_ID}.uninstall"
-UNINSTALL_COMPONENT_PKG_NAME="${PRODUCT_NAME}-uninstall-component.pkg"
-UNINSTALL_PKG_NAME="${PRODUCT_NAME}-uninstall.pkg"
+# The GUI uninstaller. It ships INSIDE the one installer package, as an app in
+# /Applications, because somebody who wants to remove this product looks on
+# their own Mac rather than on a downloads page. There is deliberately no second
+# package to build, sign, notarize or publish: one product, one installer.
+#
+# The app owns no removal logic. It runs UNINSTALLER_PATH with one native
+# administrator prompt, so the command line and the double-click are the same
+# code and cannot drift apart.
 UNINSTALL_TITLE="Uninstall ${PRODUCT_TITLE}"
+UNINSTALL_APP_NAME="${UNINSTALL_TITLE}.app"
+UNINSTALL_APP_PATH="/Applications/${UNINSTALL_APP_NAME}"
+UNINSTALL_APP_BUNDLE_ID="${BUNDLE_ID}.uninstall"
+# The bundle executable cannot contain spaces as comfortably as the bundle name
+# can, and it is never seen by a user.
+UNINSTALL_APP_EXEC="${PRODUCT_NAME}-uninstall-app"
 
 # Tag glob that build-pkg.sh derives a default VERSION from. The repo is
 # single-product, so releases are plain vX.Y.Z tags.

@@ -57,17 +57,14 @@ verifies before installing anything, and how to roll a station back are all in
 
 ## Uninstall
 
-**[Download the uninstaller](https://github.com/sharaf-nassar/browser-print-agentd/releases/latest/download/browser-print-agentd-uninstall.pkg)**,
-open it, and follow the prompts.
-
-macOS does not let an installer package rename its own button, so it still says "Install" — the
-window text says what is actually happening, and nothing is installed. If the agent is not on this
-Mac, it says so and stops rather than doing anything.
+The installer puts an uninstaller on the Mac. Open **Uninstall Browser Print Agent** from
+Applications — Spotlight finds it too — confirm, and enter your Mac password when asked. There is
+nothing to download.
 
 It removes all of it — both launchd jobs and their plists, the binary, the launcher, updater state
 and cache, keychain trust (matched by SHA-1 fingerprint, never by name), the certificate and log
-directories, and the installer receipt. It deletes the log ring too, so copy that directory first
-if you are uninstalling because something was wrong.
+directories, the installer receipt, and itself. It deletes the log ring too, so copy that directory
+first if you are uninstalling because something was wrong.
 
 The same thing from Terminal, if you prefer:
 
@@ -75,8 +72,8 @@ The same thing from Terminal, if you prefer:
 sudo /usr/local/bin/browser-print-agentd-uninstall
 ```
 
-Both run exactly the same code — the uninstaller package's only content is a script that calls the
-command above.
+Both run exactly the same code — the app is a confirm dialog and one administrator prompt in front
+of the command above.
 
 ## What the installer does
 
@@ -100,6 +97,7 @@ Installed layout:
 | ---------------------------------------------------------------------------------- | --------------------------------- |
 | `/usr/local/bin/browser-print-agentd`                                              | the agent binary                  |
 | `/usr/local/bin/browser-print-agentd-uninstall`                                    | the uninstaller                   |
+| `/Applications/Uninstall Browser Print Agent.app`                                  | GUI front end for the uninstaller |
 | `/usr/local/libexec/browser-print-agentd/launcher`                                 | agent launchd entry point         |
 | `/usr/local/libexec/browser-print-agentd/updater`                                  | short-lived root updater          |
 | `/Library/LaunchAgents/io.github.sharaf-nassar.browser-print-agentd.plist`         | per-user LaunchAgent              |

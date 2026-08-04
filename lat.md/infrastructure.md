@@ -227,7 +227,7 @@ than a habit. That lookup selects the previous release's **versioned** `.pkg` an
 excludes the [[infrastructure#Release Chain#Evergreen Download Asset|evergreen copy]]: a release
 carries two `.pkg` assets, and a version-free filename names no build, so an `endswith(".pkg")`
 match alone could report a rollback target that tells an operator nothing. Nothing in the path
-deletes, and a `--clobber` on the upload can only ever replace the five assets of the tag being
+deletes, and a `--clobber` on the upload can only ever replace the four assets of the tag being
 released, since a different tag is a different release. A prior release with no versioned `.pkg`
 warns rather than fails — the package just shipped is already published and notarized, and
 failing there would report a bad release for a defect in an older one.
@@ -242,7 +242,7 @@ A downstream consumer — the operator-facing web app whose print surface talks 
 hands a station with no agent installed a single `releases/latest/download/browser-print-agentd.pkg`
 link. GitHub answers that with a 302 to whichever release is currently marked latest, so the URL
 never has to be edited for a new version. That redirect ignores drafts and prereleases, which is
-why the release is marked `--latest` only after all five assets are attached: the link must never
+why the release is marked `--latest` only after all four assets are attached: the link must never
 resolve to a release that is still missing its installer. Renaming the asset, or shipping without
 it, 404s the only install route offered to a station that cannot print until it gets one.
 
